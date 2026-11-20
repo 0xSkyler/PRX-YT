@@ -127,3 +127,22 @@ test('renderer crash recovery recreates playback observation and respects Stop c
     assert.equal(restarted.length, 1);
     await f.manager.destroyAll();
 });
+
+test('shrinking and regrowing a workspace cannot outrun its previous native storage cleanup', async () => {
+    const f = await fixture(), clearing = deferred();
+    const originalSession = f.managed.session;
+    f.managed.pendingStorageCleanup = clearing.promise;
+    const disposing = f.manager.destroyBrowser(1);
+    await tick();
+    assert.equal(f.manager.getAll().length, 0);
+    let recreated = false;
+    const creating = f.manager.createBrowser(1, { startPage: 'about:blank' }).then(() => { recreated = true; });
+    try {
+        await tick();
+        assert.equal(recreated, false, 'The persistent partition was reused before its old clearing settled');
+    } finally { clearing.resolve(); }
+    await disposing;
+    await creating;
+    assert.equal(f.manager.get(1).session, originalSession);
+    await f.manager.destroyAll();
+});

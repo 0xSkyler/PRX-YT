@@ -1421,7 +1421,12 @@ class BrowserManager extends node_events_1.EventEmitter {
         if (this.window && !this.window.isDestroyed()) this.window.removeBrowserView(managed.view);
         if (!managed.view.webContents.isDestroyed()) managed.view.webContents.close({ waitForBeforeUnload: false });
         // Release network connections but keep every profile data store intact.
-        const cleanup = Promise.resolve(managed.proxyChange).catch(() => {}).then(async () => {
+        // A recreated ID uses the same persistent Electron Session. Keep its
+        // disposal barrier until cancelled native cache operations also settle,
+        // so shrinking/regrowing cannot clear a new video's data late.
+        const cleanup = Promise.allSettled([
+            managed.proxyChange, managed.pendingStorageCleanup, managed.playbackCleanup
+        ]).then(async () => {
             await managed.session.closeAllConnections();
             await managed.session.setProxy({ mode: 'direct' });
         });
