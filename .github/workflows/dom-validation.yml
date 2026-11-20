@@ -1,0 +1,29 @@
+name: PRX-YT identity and regression checks
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  validate-prx-yt:
+    strategy:
+      matrix:
+        os: [ubuntu-24.04, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify PRX-YT identity
+        run: node -e "const p=require('./package.json');if(p.name!=='prx-yt'||p.productName!=='PRX-YT'||p.build.appId!=='com.prxyt.desktop')throw Error('Wrong PRX-YT application identity')"
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - run: npm run check
+      - run: node scripts/check-bundled-runtime.cjs

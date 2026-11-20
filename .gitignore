@@ -1,0 +1,9 @@
+node_modules/
+release-linux/
+release-windows/
+.recovery/
+.measurements/
+*.AppImage
+
+# Historical recovery installers are fetched and verified only on demand.
+/tests/fixtures/recovery/*.exe

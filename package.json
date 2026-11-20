@@ -1,0 +1,71 @@
+{
+  "name": "prx-yt",
+  "productName": "PRX-YT",
+  "version": "1.0.0",
+  "description": "Isolated YouTube playback testing, availability research and diagnostics",
+  "author": "PRX-YT",
+  "license": "MIT",
+  "private": true,
+  "main": "src/main/main.js",
+  "scripts": {
+    "start": "electron .",
+    "test": "node --test",
+    "check": "node scripts/check-source.cjs",
+    "recover": "node scripts/recover.cjs",
+    "package:linux": "npm run check && electron-builder --linux AppImage tar.gz --x64 --publish never",
+    "package:windows": "npm run check && electron-builder --win nsis --x64 --publish never --config.directories.output=release-windows",
+    "benchmark": "node scripts/benchmark.cjs"
+  },
+  "devDependencies": {
+    "@electron/asar": "3.2.10",
+    "7zip-bin": "5.2.0",
+    "electron": "31.2.1",
+    "electron-builder": "24.13.3",
+    "playwright-core": "1.62.1"
+  },
+  "build": {
+    "appId": "com.prxyt.desktop",
+    "productName": "PRX-YT",
+    "asar": true,
+    "directories": {
+      "output": "release-linux"
+    },
+    "files": [
+      "src/main/**/*",
+      "src/preload/**/*",
+      "src/renderer/**/*",
+      "src/shared/**/*",
+      "src/proxy/AllWorkingProxyProvider.js",
+      "src/proxy/ProxyScrapeProvider.js",
+      "src/proxy/ProxyParser.js",
+      "src/proxy/ProxyTiers.js",
+      "third-party/**/*",
+      "package.json"
+    ],
+    "linux": {
+      "target": [
+        "AppImage",
+        "tar.gz"
+      ],
+      "category": "Utility",
+      "artifactName": "PRX-YT-v${version}-linux-${arch}.${ext}"
+    },
+    "win": {
+      "target": [
+        "nsis"
+      ],
+      "artifactName": "PRX-YT-v${version}-Windows-${arch}-Setup.${ext}"
+    },
+    "nsis": {
+      "oneClick": false,
+      "allowToChangeInstallationDirectory": true,
+      "perMachine": false,
+      "runAfterFinish": false,
+      "createDesktopShortcut": true,
+      "createStartMenuShortcut": true,
+      "shortcutName": "PRX-YT"
+    }
+  },
+  "linuxRelease": "v1.0.0",
+  "windowsRelease": "v1.0.0"
+}
