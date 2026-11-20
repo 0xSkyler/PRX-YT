@@ -32,6 +32,7 @@ test('YouTube workspaces use only the cache preload and ignore inherited automat
 
 test('cancelled cleanup retains its barrier until every native storage operation settles', async () => {
     const f = await fixture(), gate = deferred(), cancelled = new AbortController();
+    f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
     let clears = 0, navigations = 0;
     const nativeLoad = f.wc.loadURL.bind(f.wc);
     f.wc.loadURL = async url => { navigations++; return nativeLoad(url); };
@@ -49,7 +50,46 @@ test('cancelled cleanup retains its barrier until every native storage operation
     await secondFailure;
     f.managed.session.clearStorageData = async () => {};
     await f.manager.prepareCycleDocument(1, new AbortController().signal);
-    assert.equal(navigations, 2);
+    assert.equal(navigations, 1, 'An already released blank document was needlessly navigated again');
+    await f.manager.destroyAll();
+});
+
+test('a delayed outgoing ERR_FAILED does not reject an observed blank-document commit', async () => {
+    const f = await fixture();
+    f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
+    f.wc.loadURL = () => {
+        setImmediate(() => { f.wc.url = 'about:blank'; f.wc.emit('did-navigate', {}, 'about:blank'); });
+        return Promise.reject(new Error("ERR_FAILED (-2) loading 'about:blank'"));
+    };
+    await f.manager.releaseResearchDocument(f.managed, { timeoutMs: 200 });
+    assert.equal(f.wc.getURL(), 'about:blank');
+    assert.equal(f.wc.listenerCount('destroyed'), 0);
+    await f.manager.destroyAll();
+});
+
+test('failed blank navigation blocks cleanup and can be retried safely', async () => {
+    const f = await fixture();
+    f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
+    const original = f.wc.loadURL.bind(f.wc);
+    f.wc.loadURL = () => Promise.reject(new Error('ERR_FAILED (-2)'));
+    await assert.rejects(f.manager.releaseResearchDocument(f.managed, { timeoutMs: 10 }), /could not release/);
+    assert.notEqual(f.wc.getURL(), 'about:blank');
+    f.wc.loadURL = original;
+    await f.manager.releaseResearchDocument(f.managed, { timeoutMs: 200 });
+    assert.equal(f.wc.getURL(), 'about:blank');
+    await f.manager.destroyAll();
+});
+
+test('disabling inherited Keep Alive creates no timers or synthetic user gestures in YouTube', async () => {
+    const f = await fixture();
+    const scripts = [];
+    f.wc.executeJavaScript = (...args) => { scripts.push(args); return Promise.resolve(); };
+    f.manager.setBrowserKeepAlive(1, false);
+    f.manager.setKeepAliveAll(false);
+    f.manager.cancelKeepAliveAction(f.managed);
+    assert.equal(scripts.length, 0);
+    assert.equal(f.manager.keepAliveTimer, null);
+    assert.throws(() => f.manager.setBrowserKeepAlive(1, true), /unavailable/);
     await f.manager.destroyAll();
 });
 

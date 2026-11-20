@@ -258,6 +258,13 @@ class BrowserManager extends node_events_1.EventEmitter {
                 }
                 return;
             }
+            if (channel === 'prx:workspace-ready') {
+                if (this.workflow === 'youtube' && managed.rendererCacheRequest) {
+                    try { event.reply('dom:clear-renderer-cache', managed.rendererCacheRequest.requestId); }
+                    catch { /* The workspace may have been disposed. */ }
+                }
+                return;
+            }
             if (this.workflow === 'youtube') return;
             if (channel === 'dom:site-cookie-consent-click') {
                 // The isolated preload only reports a visible positive choice
@@ -482,12 +489,12 @@ class BrowserManager extends node_events_1.EventEmitter {
         managed.restartAttempts += 1;
         if (this.workflow === 'youtube') {
             const config = managed.playbackConfig;
-            await this.stopYouTubePlayback(managed.id);
-            if (!config || config.signal?.aborted || this.disposed || managed.disposed) return;
             try {
+                await this.stopYouTubePlayback(managed.id);
+                if (!config || config.signal?.aborted || this.disposed || managed.disposed) return;
                 await this.startYouTubePlayback(managed.id, config);
             } catch (error) {
-                if (config.signal?.aborted || managed.disposed) return;
+                if (!config || config.signal?.aborted || managed.disposed) return;
                 const playback = { status: 'error', message: `Playback recovery failed: ${error.message}`,
                     observedAt: new Date().toISOString() };
                 this.updateState(managed, { playback });
@@ -541,6 +548,37 @@ class BrowserManager extends node_events_1.EventEmitter {
     beginProxyCycle(id) {
         this.get(id).proxyHealth = { googleReached: false, youtubeReached: false, targetOpened: false, captchaSeen: false, failed: false };
     }
+    async releaseResearchDocument(managed, { signal, timeoutMs = 5_000 } = {}) {
+        const wc = managed.view.webContents;
+        if (managed.disposed || wc.isDestroyed()) return;
+        wc.stop();
+        // Stop already released this document. Re-navigating about:blank can
+        // race Chromium's delayed cancellation of an unfinished media request.
+        if (wc.getURL() === 'about:blank') return;
+        let navigated, destroyed;
+        const closed = new Promise((resolve, reject) => {
+            navigated = (_event, url) => { if (url === 'about:blank') resolve(); };
+            destroyed = () => resolve();
+            wc.on('did-navigate', navigated);
+            wc.on('destroyed', destroyed);
+            void Promise.resolve().then(() => wc.loadURL('about:blank')).then(() => {
+                if (wc.getURL() === 'about:blank') resolve();
+            }).catch(error => {
+                // Electron can associate the outgoing request's ERR_FAILED or
+                // ERR_ABORTED with loadURL('about:blank'). Confirm the actual
+                // committed URL; never clear storage based on rejection alone.
+                if (!wc.isDestroyed() && wc.getURL() === 'about:blank') resolve();
+                else if (!/ERR_ABORTED|ERR_FAILED|\(-[23]\)/i.test(error.message || String(error))) reject(error);
+            });
+        });
+        try {
+            await waitForPreparation(closed, timeoutMs, signal,
+                `Browser ${managed.id} could not release its outgoing video document.`);
+        } finally {
+            wc.removeListener('did-navigate', navigated);
+            wc.removeListener('destroyed', destroyed);
+        }
+    }
     async prepareCycleDocument(id, signal) {
         // Release the outgoing page and any navigation that was still
         // committing when the cycle ended. The local blank document installs
@@ -557,6 +595,9 @@ class BrowserManager extends node_events_1.EventEmitter {
         }
         this.closePopupWindows(managed);
         const wc = managed.view.webContents;
+        if (this.workflow === 'youtube') {
+            await this.releaseResearchDocument(managed, { signal });
+        } else {
         let navigated;
         const closed = new Promise((resolve, reject) => {
             navigated = (_event, url) => { if (url === 'about:blank') resolve(); };
@@ -574,6 +615,7 @@ class BrowserManager extends node_events_1.EventEmitter {
             await waitForPreparation(closed, 15_000, signal,
                 `Browser ${id} could not close its outgoing page before the next cycle.`);
         } finally { wc.removeListener('did-navigate', navigated); }
+        }
         // The shell/settings use a different session. Clear only this browser's
         // profile after its outgoing document and popups have been released.
         const clearing = [
@@ -837,22 +879,27 @@ class BrowserManager extends node_events_1.EventEmitter {
         if (!managed) return Promise.resolve();
         const controller = managed.playbackController;
         managed.playbackConfig = null;
-        if (!controller) return managed.playbackCleanup || Promise.resolve();
+        if (!controller && managed.playbackCleanup) return managed.playbackCleanup;
+        if (!controller && !managed.playbackReleaseNeeded) return Promise.resolve();
         managed.playbackController = null;
+        managed.playbackReleaseNeeded = true;
         if (!managed.view.webContents.isDestroyed()) managed.view.webContents.setAudioMuted(true);
-        const cleanup = Promise.resolve(controller.stop()).then(async () => {
+        const cleanup = Promise.resolve(controller?.stop()).then(async () => {
             if (managed.disposed || managed.view.webContents.isDestroyed()) return;
             // Releasing the document also stops YouTube's own timers/autoplay,
             // including a late play promise after the user presses Stop.
-            const wc = managed.view.webContents;
-            if (wc.getURL() !== 'about:blank') {
-                await waitForPreparation(wc.loadURL('about:blank'), 5_000, undefined,
-                    `Browser ${id} could not release its stopped video.`);
-            }
-        }).catch((error) => {
-            Logger_1.logger.warn('browser', `Browser ${id} playback stop: ${error.message}`);
+            await this.releaseResearchDocument(managed);
         });
         managed.playbackCleanup = cleanup;
+        void cleanup.then(() => {
+            if (managed.playbackCleanup === cleanup) {
+                managed.playbackCleanup = null;
+                managed.playbackReleaseNeeded = false;
+            }
+        }, error => {
+            if (managed.playbackCleanup === cleanup) managed.playbackCleanup = null;
+            Logger_1.logger.warn('browser', `Browser ${id} playback stop: ${error.message}`);
+        });
         this.updateState(managed, { playback: { ...managed.state.playback, status: 'stopped', message: 'Playback stopped.' } });
         return cleanup;
     }
@@ -1529,6 +1576,7 @@ class BrowserManager extends node_events_1.EventEmitter {
     }
     cancelKeepAliveAction(managed) {
         managed.keepAlivePendingNavigation = null;
+        if (this.workflow === 'youtube') return;
         const wc = managed.view.webContents;
         if (!wc.isDestroyed()) {
             void wc.executeJavaScript('window.__domKeepAliveController?.abort(); delete window.__domKeepAliveReading;', true).catch(() => undefined);
@@ -1547,6 +1595,11 @@ class BrowserManager extends node_events_1.EventEmitter {
         this.setKeepAliveAll(enabled, enabled);
     }
     setBrowserKeepAlive(id, enabled, resetHops = false) {
+        if (this.workflow === 'youtube') {
+            if (enabled) throw new Error('Keep Alive navigation is unavailable in PRX-YT.');
+            this.get(id).keepAliveEnabled = false;
+            return;
+        }
         this.ensureKeepAliveTimer();
         const managed = this.get(id);
         this.cancelKeepAliveAction(managed);
@@ -1580,6 +1633,11 @@ class BrowserManager extends node_events_1.EventEmitter {
             queueMicrotask(() => this.tickKeepAlive());
     }
     setKeepAliveAll(enabled, resetHops = false) {
+        if (this.workflow === 'youtube') {
+            if (enabled) throw new Error('Keep Alive navigation is unavailable in PRX-YT.');
+            for (const managed of this.browsers.values()) managed.keepAliveEnabled = false;
+            return;
+        }
         this.ensureKeepAliveTimer();
         for (const managed of this.browsers.values()) {
             this.cancelKeepAliveAction(managed);

@@ -22,10 +22,30 @@ const VIDEO_URL = `https://www.youtube.com/watch?v=${VIDEO_ID}`;
 const inputUrl = `https://youtu.be/${VIDEO_ID}?si=native-fixture`;
 const mediaBase64 = fs.readFileSync(path.join(root, 'tests/fixtures/youtube/playback.webm')).toString('base64');
 const servers = [];
-let app, page, phase = 'launch', stderr = '', providerRequests = 0;
+let app, page, phase = 'launch', stderr = '', providerRequests = 0, expectedCycleNumber = null;
 const timings = [];
 const startedAt = Date.now();
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function logPhase(next, details = {}) {
+    phase = next;
+    console.log(JSON.stringify({ nativeSmokeStage: phase, elapsedMs: Date.now() - startedAt, ...details }));
+}
+async function assertHealthyCycle(expectedCycle = expectedCycleNumber) {
+    const state = await page.evaluate(() => window.app.automation.getState());
+    assert.equal(state.lastError, undefined, `Cycle ${state.cycleNumber} failed: ${state.lastError}`);
+    assert.equal(state.running, true, 'Playback unexpectedly stopped during the fixture');
+    if (expectedCycle != null) assert.equal(state.cycleNumber, expectedCycle,
+        `Expected cycle ${expectedCycle}; a later cycle must not satisfy an earlier cycle's assertions`);
+    return state;
+}
+async function waitForCycle(expected, timeoutMs = 30_000) {
+    return waitForAutomation(page, state => {
+        assert.equal(state.lastError, undefined, `Cycle ${state.cycleNumber} failed: ${state.lastError}`);
+        assert.equal(state.running, true, 'Playback stopped while waiting for a cycle');
+        assert.ok(state.cycleNumber <= expected, `Missed expected cycle ${expected}; observed ${state.cycleNumber}`);
+        return state.cycleNumber === expected && !state.cycleInProgress;
+    }, undefined, { timeoutMs });
+}
 
 async function serve(handler) {
     const server = http.createServer(handler);
@@ -40,6 +60,7 @@ async function serve(handler) {
 }
 
 async function launch() {
+    logPhase('launching native application', { artifact: sourceRun ? 'source' : path.basename(target) });
     const linuxTestSandbox = process.platform === 'linux' && process.env.PRX_YT_TEST_SANDBOX !== '1';
     if (process.platform === 'linux' && !process.env.DISPLAY && !process.env.WAYLAND_DISPLAY) {
         throw new Error('The native BrowserView fixture requires a graphical session or Xvfb. Run on a native Windows runner or use xvfb-run on Linux.');
@@ -65,7 +86,8 @@ async function launch() {
 async function installResearchFixtures() {
     await app.evaluate(({ session }, { mediaBase64, videoId }) => {
         const clip = Buffer.from(mediaBase64, 'base64');
-        globalThis.__prxYtFixture = { modes: {}, requests: [], documents: 0, unfinishedResponses: 0, rejectedRequests: [] };
+        globalThis.__prxYtFixture = { modes: {}, expectedCycle: 1, requests: [], documents: 0,
+            documentRecords: [], unfinishedResponses: 0, rejectedRequests: [] };
         const fixture = globalThis.__prxYtFixture;
         for (let id = 1; id <= 100; id++) {
             const ses = session.fromPartition(`persist:browser-${id}`);
@@ -104,12 +126,14 @@ async function installResearchFixtures() {
                 }
                 const mode = fixture.modes[id] || 'normal';
                 const documentId = ++fixture.documents;
+                const expectedCycle = fixture.expectedCycle;
+                fixture.documentRecords.push({ browserId: id, documentId, mode, expectedCycle, at: Date.now() });
                 return new Response(`<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>PRX-YT native fixture</title>
                     <style>body{margin:0;background:#15181e;color:white;font:14px sans-serif}video{width:100%;height:160px}.ytp-error-content-wrap{padding:20px}</style></head>
                     <body><main id="movie_player"><video class="html5-main-video" controls preload="auto" src="/__prx_fixture__/playback.webm"></video></main>
                     <img src="/__prx_fixture__/unfinished.png" width="1" height="1" alt="">
                     <script>
-                    window.fixture = { browserId: ${id}, documentId: ${documentId}, mode: ${JSON.stringify(mode)},
+                    window.fixture = { browserId: ${id}, documentId: ${documentId}, expectedCycle: ${expectedCycle}, mode: ${JSON.stringify(mode)},
                         beforeStorage: localStorage.getItem('prx-fixture-session'), playCount: 0, endedCount: 0 };
                     localStorage.setItem('prx-fixture-session', String(${id}));
                     const video = document.querySelector('video');
@@ -141,6 +165,7 @@ async function waitForBrowsers(predicate, label, timeoutMs = 20_000) {
     const deadline = Date.now() + timeoutMs;
     let states;
     do {
+        if (expectedCycleNumber != null) await assertHealthyCycle();
         states = await withinDeadline(browserStates(), Math.max(1, deadline - Date.now()), 'Browser states');
         if (predicate(states)) return states;
         await sleep(80);
@@ -156,7 +181,8 @@ async function mediaSnapshot(ids = [1, 2]) {
             const value = await wc.mainFrame.executeJavaScript(`(() => {
                 const video = document.querySelector('video');
                 return { browserId: ${id}, url: location.href, fixture: window.fixture ? { browserId: window.fixture.browserId,
-                    documentId: window.fixture.documentId, beforeStorage: window.fixture.beforeStorage,
+                    documentId: window.fixture.documentId, expectedCycle: window.fixture.expectedCycle, mode: window.fixture.mode,
+                    beforeStorage: window.fixture.beforeStorage,
                     playCount: window.fixture.playCount, endedCount: window.fixture.endedCount } : null,
                     localStorage: location.protocol === 'https:' ? localStorage.getItem('prx-fixture-session') : null,
                     media: video ? { currentTime: video.currentTime, duration: video.duration, ended: video.ended,
@@ -169,22 +195,31 @@ async function mediaSnapshot(ids = [1, 2]) {
 }
 
 async function startFleet(count) {
-    phase = `preparing ${count} browsers`;
+    expectedCycleNumber = null;
+    logPhase(`preparing ${count} browsers`);
+    await app.evaluate(() => { if (globalThis.__prxYtFixture) globalThis.__prxYtFixture.expectedCycle = 1; });
     await page.getByLabel('Browsers', { exact: true }).fill(String(count));
     const start = Date.now();
     await page.getByRole('button', { name: 'Start', exact: true }).click();
-    const state = await waitForAutomation(page, (value, expected) => value.running && !value.preparingBrowsers &&
-        !value.cycleInProgress && value.cycleNumber >= 1 && value.assignedBrowsers === expected, count, { timeoutMs: 40_000 });
+    const state = await waitForAutomation(page, (value, expected) => {
+        assert.equal(value.lastError, undefined, `Fleet startup failed: ${value.lastError}`);
+        return value.running && !value.preparingBrowsers && !value.cycleInProgress &&
+            value.cycleNumber >= 1 && value.assignedBrowsers === expected;
+    }, count, { timeoutMs: 40_000 });
     assert.equal(state.lastError, undefined);
+    assert.equal(state.cycleNumber, 1, 'Initial cycle did not settle before the next boundary');
+    expectedCycleNumber = 1;
     assert.equal(state.preparedBrowsers, count);
     assert.equal((await browserStates()).length, count);
     const live = await app.evaluate(({ webContents }) => webContents.getAllWebContents().filter(wc => !wc.isDestroyed()).length);
     assert.equal(live, count + 1, 'Resizing leaked a native browser');
     timings.push({ browserCount: count, preparationMs: Date.now() - start });
+    logPhase(`${count}-browser first cycle ready`, { cycleNumber: state.cycleNumber, assignedBrowsers: state.assignedBrowsers, providerRequests });
     return state;
 }
 async function stopFleet() {
-    phase = 'stopping playback';
+    logPhase('stopping playback', { expectedCycleNumber });
+    expectedCycleNumber = null;
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await waitForAutomation(page, state => !state.running && !state.preparingBrowsers);
     await page.getByRole('button', { name: 'Start', exact: true }).waitFor({ state: 'visible' });
@@ -206,7 +241,7 @@ async function run() {
     const endpoint = `http://127.0.0.1:${providerPort}/proxies`;
     await launch();
     await installResearchFixtures();
-    phase = 'checking dashboard and validation';
+    logPhase('checking dashboard and validation');
     await page.waitForFunction(() => document.querySelectorAll('.browser-card').length === 10);
     for (const name of ['Keywords', 'Target website', 'Search engine']) assert.equal(await page.getByLabel(name, { exact: true }).count(), 0);
     assert.equal(await page.getByRole('button', { name: /Keep Alive/i }).count(), 0);
@@ -229,15 +264,22 @@ async function run() {
     await page.getByLabel('Muted playback', { exact: true }).check();
     await page.evaluate(() => {
         window.__prxPreparation = [];
+        window.__prxCycles = [];
         window.app.automation.onStateChanged(state => {
             if (state.preparingBrowsers) window.__prxPreparation.push({ count: state.browserCount, ready: state.preparedBrowsers });
+            window.__prxCycles.push({ at: Date.now(), running: state.running, cycleNumber: state.cycleNumber,
+                cycleInProgress: state.cycleInProgress, preparingBrowsers: state.preparingBrowsers, lastError: state.lastError,
+                lastCycleStartedAt: state.lastCycleStartedAt, nextCycleAt: state.nextCycleAt });
+            if (window.__prxCycles.length > 300) window.__prxCycles.shift();
         });
     });
     const firstState = await startFleet(2);
     assert.equal(firstState.videoUrl, VIDEO_URL);
-    phase = 'verifying real media playback';
+    logPhase('verifying real media playback', { cycleNumber: firstState.cycleNumber });
     await waitForBrowsers(states => states.length === 2 && states.every(state => state.playback?.status === 'playing' && state.playback.currentTime > 0), 'Actual media playback');
     const first = await mediaSnapshot();
+    assert.ok(first.every(value => value.fixture.expectedCycle === firstState.cycleNumber && value.fixture.mode === 'normal'));
+    logPhase('initial media verified', { documents: first.map(value => value.fixture), positions: first.map(value => value.media.currentTime) });
     if (process.env.PRX_YT_SMOKE_SCREENSHOT) await page.screenshot({
         path: path.resolve(process.env.PRX_YT_SMOKE_SCREENSHOT.replace(/\.png$/, '-playing.png'))
     });
@@ -249,6 +291,7 @@ async function run() {
     assert.ok(routes.every(route => /^PROXY 127\.0\.0\.1:\d+$/.test(route)), JSON.stringify(routes));
     assert.notEqual(routes[0], routes[1], 'Browser profiles share the same proxy assignment');
 
+    logPhase('manual playback controls');
     await page.getByRole('button', { name: 'Pause Browser 1', exact: true }).click();
     await waitForBrowsers(states => states[0].playback?.status === 'paused', 'Manual pause');
     const paused = (await mediaSnapshot([1]))[0].media.currentTime;
@@ -260,6 +303,7 @@ async function run() {
     await waitForBrowsers(states => states[0].playback?.muted === true, 'Manual mute');
     await page.getByRole('button', { name: 'Play Browser 1', exact: true }).click();
     await waitForBrowsers(states => states[0].playback?.status === 'playing', 'Manual play');
+    logPhase('waiting for natural video ending');
     await waitForBrowsers(states => states.every(state => state.playback?.status === 'ended'), 'Natural video ending', 15_000);
     const ended = await mediaSnapshot();
     await sleep(1200);
@@ -267,36 +311,66 @@ async function run() {
     assert.deepEqual(stillEnded.map(value => value.fixture.playCount), ended.map(value => value.fixture.playCount), 'Ended playback was automatically restarted');
     assert.ok(stillEnded.every(value => value.media.ended && value.media.paused));
 
-    phase = 'manual cycle, cleanup and autoplay restrictions';
+    logPhase('manual cycle, cleanup and autoplay restrictions');
     const requestsBeforeCycle = providerRequests;
-    await app.evaluate(() => { globalThis.__prxYtFixture.modes[2] = 'blocked'; });
+    const beforeManual = await assertHealthyCycle(1);
+    const manualCycle = beforeManual.cycleNumber + 1;
+    await app.evaluate((_electron, cycle) => {
+        globalThis.__prxYtFixture.modes[2] = 'blocked';
+        globalThis.__prxYtFixture.expectedCycle = cycle;
+    }, manualCycle);
     await page.getByRole('button', { name: 'Run Now', exact: true }).click();
-    const secondState = await waitForAutomation(page, state => state.cycleNumber === 2 && !state.cycleInProgress);
+    const secondState = await waitForCycle(manualCycle);
+    expectedCycleNumber = manualCycle;
+    assert.equal(secondState.lastError, undefined, 'Manual cycle setup reported an error');
+    assert.equal(secondState.cycleNumber, manualCycle);
+    logPhase('manual cycle setup complete', { cycleNumber: secondState.cycleNumber, retainedBrowsers: secondState.retainedBrowsers });
     assert.equal(secondState.retainedBrowsers, 2);
     assert.equal(secondState.replacedBrowsers, 0);
     assert.equal(providerRequests, requestsBeforeCycle, 'An all-healthy cycle fetched the proxy provider again');
     await waitForBrowsers(states => states[0].playback?.status === 'playing' && states[1].playback?.status === 'autoplay-blocked', 'Blocked playback reporting');
     const second = await mediaSnapshot();
+    await assertHealthyCycle(manualCycle);
+    assert.ok(second.every(value => value.fixture.expectedCycle === manualCycle), 'Manual-cycle documents have an unexpected cycle marker');
+    assert.deepEqual(second.map(value => value.fixture.mode), ['normal', 'blocked']);
+    logPhase('manual cycle media verified', { cycleNumber: manualCycle, documents: second.map(value => value.fixture) });
     assert.ok(second.every(value => value.fixture.beforeStorage === null), 'Cycle cleanup retained outgoing page storage');
     assert.ok(second.every((value, index) => value.fixture.documentId !== first[index].fixture.documentId), 'Cycle reused its old document');
     assert.ok(second[0].media.currentTime < ended[0].media.currentTime, 'Cycle did not reset playback position');
     assert.equal(second[1].fixture.playCount, 1);
     await sleep(1200);
+    await assertHealthyCycle(manualCycle);
     assert.equal((await mediaSnapshot([2]))[0].fixture.playCount, 1, 'Autoplay rejection caused an automatic retry loop');
     await app.evaluate(async ({ session, webContents }) => {
         const wc = webContents.getAllWebContents().find(value => value.session === session.fromPartition('persist:browser-2'));
         await wc.mainFrame.executeJavaScript('window.fixture.showUnavailable()', false);
     });
     await waitForBrowsers(states => states[1].playback?.status === 'unavailable', 'Unavailable video reporting');
-    await app.evaluate(() => { globalThis.__prxYtFixture.modes[2] = 'normal'; });
+    const beforeScheduled = await assertHealthyCycle(manualCycle);
+    const scheduledCycle = beforeScheduled.cycleNumber + 1;
+    const boundaryAt = Date.parse(beforeScheduled.nextCycleAt);
+    assert.ok(Number.isFinite(boundaryAt), 'The running application did not publish its next cycle boundary');
+    await app.evaluate((_electron, cycle) => {
+        globalThis.__prxYtFixture.modes[2] = 'normal';
+        globalThis.__prxYtFixture.expectedCycle = cycle;
+    }, scheduledCycle);
 
-    phase = 'scheduled cycle';
-    const scheduled = await waitForAutomation(page, state => state.cycleNumber >= 3 && !state.cycleInProgress, undefined, { timeoutMs: 35_000 });
+    logPhase('waiting for the next scheduled cycle', { fromCycle: beforeScheduled.cycleNumber, expectedCycle: scheduledCycle,
+        nextCycleAt: beforeScheduled.nextCycleAt, remainingMs: Math.max(0, boundaryAt - Date.now()) });
+    const scheduled = await waitForCycle(scheduledCycle, Math.max(20_000, boundaryAt - Date.now() + 15_000));
+    expectedCycleNumber = scheduledCycle;
+    assert.equal(scheduled.lastError, undefined, 'Scheduled cycle setup reported an error');
+    assert.equal(scheduled.cycleNumber, scheduledCycle);
+    assert.ok(Date.parse(scheduled.lastCycleStartedAt) > Date.parse(beforeScheduled.lastCycleStartedAt), 'Scheduled cycle did not start a new cycle');
+    logPhase('scheduled cycle setup complete', { cycleNumber: scheduled.cycleNumber, retainedBrowsers: scheduled.retainedBrowsers });
     assert.equal(scheduled.retainedBrowsers, 2);
     assert.equal(providerRequests, requestsBeforeCycle, 'Scheduled healthy retention fetched the provider');
     await waitForBrowsers(states => states.every(state => state.playback?.status === 'playing'), 'Playback after scheduled reset');
     const third = await mediaSnapshot();
+    await assertHealthyCycle(scheduledCycle);
+    assert.ok(third.every(value => value.fixture.expectedCycle === scheduledCycle && value.fixture.mode === 'normal'));
     assert.ok(third.every((value, index) => value.fixture.beforeStorage === null && value.fixture.documentId !== second[index].fixture.documentId));
+    logPhase('scheduled cycle media verified', { cycleNumber: scheduledCycle, documents: third.map(value => value.fixture) });
     await stopFleet();
     await waitForBrowsers(states => states.every(state => state.playback?.status === 'stopped'), 'Stop diagnostics');
     await withinDeadline((async () => {
@@ -312,7 +386,7 @@ async function run() {
             ['playing', 'ended'].includes(state.playback?.status) && state.playback.currentTime > 0), `${count}-browser media playback`);
         await stopFleet();
     }
-    phase = 'cancelling 100-browser preparation';
+    logPhase('cancelling 100-browser preparation');
     await page.getByLabel('Browsers', { exact: true }).fill('100');
     await page.getByRole('button', { name: 'Start', exact: true }).click();
     await page.waitForFunction(() => window.__prxPreparation.some(value => value.count === 100 && value.ready > 20 && value.ready < 100));
@@ -330,7 +404,7 @@ async function run() {
     assert.ok(trace.requests.every(request => new URL(request.url).hostname === 'www.youtube.com'));
     assert.ok(trace.requests.every(request => ['/watch', '/__prx_fixture__/playback.webm', '/__prx_fixture__/unfinished.png'].includes(new URL(request.url).pathname)));
 
-    phase = 'settings persistence and graceful restart';
+    logPhase('settings persistence and graceful restart');
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('prx-yt.settings.v1'))?.browserCount === 20);
     const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('prx-yt.settings.v1')));
     assert.equal(saved.videoUrl, inputUrl);
@@ -366,8 +440,20 @@ run().catch(async error => {
         if (page && process.env.PRX_YT_SMOKE_SCREENSHOT) {
             await page.screenshot({ path: path.resolve(process.env.PRX_YT_SMOKE_SCREENSHOT.replace(/\.png$/, '-failure.png')) }).catch(() => {});
         }
-        try { console.error(JSON.stringify(await withinDeadline(browserStates(), 3000, 'Failure state'), null, 2)); }
-        catch { /* The renderer may already have exited. */ }
+        const diagnostics = await Promise.allSettled([
+            withinDeadline(browserStates(), 3000, 'Failure browser states'),
+            withinDeadline(page.evaluate(async () => ({ automation: await window.app.automation.getState(), cycles: window.__prxCycles })), 3000, 'Failure automation state'),
+            withinDeadline(app.evaluate(() => {
+                const fixture = globalThis.__prxYtFixture;
+                return fixture ? { modes: fixture.modes, expectedCycle: fixture.expectedCycle, documents: fixture.documents,
+                    documentRecords: fixture.documentRecords.slice(-40), requests: fixture.requests.slice(-80),
+                    rejectedRequests: fixture.rejectedRequests, unfinishedResponses: fixture.unfinishedResponses } : null;
+            }), 3000, 'Failure fixture trace'),
+            withinDeadline(mediaSnapshot(), 3000, 'Failure document snapshots')
+        ]);
+        console.error(JSON.stringify({ expectedCycleNumber, providerRequests,
+            diagnostics: diagnostics.map((result, index) => ({ kind: ['browsers', 'automation', 'fixtures', 'documents'][index],
+                ...(result.status === 'fulfilled' ? { value: result.value } : { error: result.reason?.message || String(result.reason) }) })) }, null, 2));
     }
     console.error(stderr);
     process.exitCode = 1;

@@ -10,3 +10,6 @@ ipcRenderer.on('dom:clear-renderer-cache', (_event, requestId) => {
         ipcRenderer.send('dom:renderer-cache-cleared', { requestId, error: error.message });
     }
 });
+// Replays an already pending clear request if navigation installed this preload
+// after the main process sent it. No page APIs are exposed to the website.
+ipcRenderer.send('prx:workspace-ready');
