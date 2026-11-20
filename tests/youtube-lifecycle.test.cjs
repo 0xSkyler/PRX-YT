@@ -67,16 +67,19 @@ test('a delayed outgoing ERR_FAILED does not reject an observed blank-document c
     await f.manager.destroyAll();
 });
 
-test('failed blank navigation blocks cleanup and can be retried safely', async () => {
+test('failed blank navigation and failed replacement block cleanup and can be retried safely', async () => {
     const f = await fixture();
     f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
-    const original = f.wc.loadURL.bind(f.wc);
+    const OriginalView = f.electron.BrowserView;
+    f.electron.BrowserView = class extends OriginalView {
+        constructor(options) { super(options); this.webContents.loadURL = () => Promise.reject(new Error('ERR_FAILED (-2)')); }
+    };
     f.wc.loadURL = () => Promise.reject(new Error('ERR_FAILED (-2)'));
     await assert.rejects(f.manager.releaseResearchDocument(f.managed, { timeoutMs: 10 }), /could not release/);
-    assert.notEqual(f.wc.getURL(), 'about:blank');
-    f.wc.loadURL = original;
+    assert.equal(f.managed.blankDocumentReady, false);
+    f.managed.view.webContents.loadURL = async function(url) { this.url = url; this.emit('dom-ready'); };
     await f.manager.releaseResearchDocument(f.managed, { timeoutMs: 200 });
-    assert.equal(f.wc.getURL(), 'about:blank');
+    assert.equal(f.managed.blankDocumentReady, true);
     await f.manager.destroyAll();
 });
 
@@ -145,4 +148,167 @@ test('shrinking and regrowing a workspace cannot outrun its previous native stor
     await creating;
     assert.equal(f.manager.get(1).session, originalSession);
     await f.manager.destroyAll();
+});
+
+test('initial blank readiness follows the committed document even when loadURL never settles', async () => {
+    const electron = fakeElectron();
+    const OriginalView = electron.BrowserView;
+    electron.BrowserView = class extends OriginalView {
+        constructor(options) {
+            super(options);
+            this.webContents.loadURL = url => {
+                setImmediate(() => { this.webContents.url = url; this.webContents.emit('dom-ready'); });
+                return new Promise(() => {});
+            };
+        }
+    };
+    const { BrowserManager } = loadTree(path.resolve(__dirname, '../src'), electron)('main/BrowserManager.js');
+    const manager = new BrowserManager({ workflow: 'youtube' });
+    manager.preparationTimeoutMs = 30;
+    manager.attachWindow(electron.window);
+    await manager.createBrowser(1, { startPage: 'about:blank' });
+    assert.equal(manager.get(1).view.webContents.getURL(), 'about:blank');
+    await manager.destroyAll();
+});
+
+test('a stuck outgoing document is replaced in its existing session before cleanup can continue', async () => {
+    const f = await fixture(), oldView = f.managed.view, clearing = deferred();
+    f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
+    f.wc.loadURL = () => new Promise(() => {});
+    f.managed.pendingStorageCleanup = clearing.promise;
+    await f.manager.releaseResearchDocument(f.managed, { timeoutMs: 10 });
+    assert.notEqual(f.managed.view, oldView);
+    assert.equal(f.wc.isDestroyed(), true);
+    assert.equal(f.managed.view.webContents.getURL(), 'about:blank');
+    assert.equal(f.managed.view.options.webPreferences.session, f.managed.session);
+    assert.equal(f.managed.pendingStorageCleanup, clearing.promise);
+    clearing.resolve();
+    await f.manager.destroyAll();
+});
+
+test('cycle preparation clears history on the replacement view after releasing a failed native document', async () => {
+    const f = await fixture(), OriginalView = f.electron.BrowserView;
+    let historyClears = 0;
+    f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
+    f.wc.loadURL = () => Promise.reject(new Error('Native blank navigation could not start.'));
+    f.wc.clearHistory = () => { if (f.wc.isDestroyed()) throw new Error('Object has been destroyed'); };
+    f.electron.BrowserView = class extends OriginalView {
+        constructor(options) { super(options); this.webContents.clearHistory = () => { historyClears++; }; }
+    };
+    await f.manager.prepareCycleDocument(1, new AbortController().signal);
+    assert.equal(f.wc.isDestroyed(), true);
+    assert.equal(historyClears, 1);
+    assert.equal(f.managed.rendererCacheRequest, null);
+    await f.manager.destroyAll();
+});
+
+test('YouTube navigation rejects proxy addresses and other videos across public and page paths', async () => {
+    const f = await fixture(), videoUrl = 'https://www.youtube.com/watch?v=abcdefghijk';
+    f.managed.playbackConfig = { videoUrl };
+    for (const target of ['http://103.237.102.191:11111', 'https://www.google.com/search?q=test', 'https://www.youtube.com/watch?v=aaaaaaaaaaa']) {
+        await assert.rejects(f.manager.navigate(1, target), /configured YouTube video/);
+        let prevented = false;
+        f.wc.emit('will-navigate', { preventDefault() { prevented = true; } }, target);
+        assert.equal(prevented, true, target);
+        f.wc.url = target;
+        await assert.rejects(f.manager.reload(1), /configured YouTube video/);
+        await assert.rejects(f.manager.restart(1), /configured YouTube video/);
+    }
+    for (const target of [videoUrl, 'https://consent.youtube.com/m', 'https://accounts.google.com/ServiceLogin', 'https://www.google.co.uk/sorry/index']) {
+        let prevented = false;
+        f.wc.emit('will-redirect', { preventDefault() { prevented = true; } }, target, false, true);
+        assert.equal(prevented, false, target);
+    }
+    await f.manager.destroyAll();
+});
+
+test('a Google verification redirect stays a user-action state without legacy proxy failure', async () => {
+    const f = await fixture();
+    f.managed.state.proxy = { protocol: 'http', host: '103.237.102.191', port: 11111 };
+    f.wc.url = 'https://www.google.com/sorry/index';
+    f.wc.emit('did-navigate', {}, f.wc.url, 429);
+    f.wc.emit('dom-ready');
+    assert.notEqual(f.managed.state.connectionStatus, 'proxy-failed');
+    assert.doesNotMatch(f.managed.state.errorMessage || '', /proxy will be replaced/);
+    assert.equal(f.managed.proxyHealth.failed, false);
+    await f.manager.destroyAll();
+});
+
+test('origin document errors remain distinct from confirmed proxy transport errors', async () => {
+    const f = await fixture();
+    f.managed.state.proxy = { protocol: 'http', host: '103.237.102.191', port: 11111 };
+    f.wc.emit('did-fail-load', {}, -202, 'ERR_CERT_AUTHORITY_INVALID', 'https://www.youtube.com/watch?v=abcdefghijk', true);
+    assert.equal(f.managed.state.connectionStatus, 'navigation-failed');
+    assert.equal(f.managed.proxyHealth.failed, false);
+    f.wc.emit('did-fail-load', {}, -130, 'ERR_PROXY_CONNECTION_FAILED', 'https://www.youtube.com/watch?v=abcdefghijk', true);
+    assert.equal(f.managed.state.connectionStatus, 'proxy-failed');
+    assert.equal(f.managed.proxyHealth.failed, true);
+    await f.manager.destroyAll();
+});
+
+test('legacy search and Keep Alive entry points cannot execute in a YouTube workspace', async () => {
+    const f = await fixture();
+    await assert.rejects(f.manager.broadcastSearch(1, 'test', 'example.com'), /unavailable/);
+    await assert.rejects(f.manager.clickControlledGoogleResult(1, 'test', 'example.com', 'https://example.com', 1), /unavailable/);
+    assert.throws(() => f.manager.startControlledKeepAlive(1, 'example.com'), /unavailable/);
+    f.manager.configureKeepAlive(1000, 10, true);
+    assert.equal(f.manager.keepAliveTimer, null);
+    await f.manager.destroyAll();
+});
+
+test('consent and login documents require an active configured playback before public navigation', async () => {
+    const f = await fixture();
+    for (const target of ['https://consent.youtube.com/m', 'https://accounts.google.com/ServiceLogin', 'https://www.google.com/sorry/index']) {
+        await assert.rejects(f.manager.navigate(1, target), /configured YouTube video/);
+    }
+    await f.manager.destroyAll();
+});
+
+test('a renderer crash is reported as a browser failure without claiming the proxy transport failed', async () => {
+    const f = await fixture();
+    f.managed.state.proxy = { protocol: 'http', host: '103.237.102.191', port: 11111 };
+    f.wc.emit('render-process-gone', {}, { reason: 'oom' });
+    assert.equal(f.managed.state.connectionStatus, 'crashed');
+    assert.equal(f.managed.proxyHealth.failed, false);
+    await f.manager.destroyAll();
+});
+
+test('a synchronous playback callback cannot navigate after aborting its own run', async () => {
+    const f = await fixture(), abort = new AbortController(), loads = [];
+    await f.manager.assignProxy(1, { protocol: 'http', host: '103.237.102.191', port: 11111 });
+    const original = f.wc.loadURL.bind(f.wc);
+    f.wc.loadURL = url => { loads.push(url); return original(url); };
+    await assert.rejects(f.manager.startYouTubePlayback(1, {
+        videoUrl: 'https://youtu.be/abcdefghijk', muted: true, signal: abort.signal,
+        onState() { abort.abort(); }
+    }), { name: 'AbortError' });
+    assert.equal(loads.includes('https://www.youtube.com/watch?v=abcdefghijk'), false);
+    await f.manager.destroyAll();
+});
+
+test('state observers that Stop or remove the owner prevent later playback callbacks and navigation', async () => {
+    for (const action of ['stop', 'remove']) {
+        const f = await fixture(), loads = [];
+        await f.manager.assignProxy(1, { protocol: 'http', host: '103.237.102.191', port: 11111 });
+        const original = f.wc.loadURL.bind(f.wc);
+        f.wc.loadURL = url => { loads.push(url); return original(url); };
+        let callbacks = 0;
+        const observer = state => {
+            if (state.playback?.status !== 'loading') return;
+            if (action === 'stop') void f.manager.stopYouTubePlayback(1);
+            else f.manager.browsers.delete(1);
+        };
+        f.manager.on('stateChanged', observer);
+        try {
+            await assert.rejects(f.manager.startYouTubePlayback(1, {
+                videoUrl: 'https://youtu.be/abcdefghijk', muted: true, onState() { callbacks++; }
+            }), { name: 'AbortError' });
+            assert.equal(callbacks, 0, action);
+            assert.equal(loads.includes('https://www.youtube.com/watch?v=abcdefghijk'), false, action);
+        } finally {
+            f.manager.removeListener('stateChanged', observer);
+            f.manager.browsers.set(1, f.managed);
+            await f.manager.destroyAll();
+        }
+    }
 });

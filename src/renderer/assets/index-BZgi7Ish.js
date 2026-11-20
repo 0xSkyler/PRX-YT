@@ -147,10 +147,10 @@ function gp() {
                     : running ? automation?.cycleInProgress ? 'RESETTING' : 'RUNNING' : 'STOPPED' })
         ] }),
         g.jsxs('div', { className: 'tracker-controls', children: [
-            g.jsxs('label', { className: 'youtube-url-field', children: ['YouTube Video URL',
-                g.jsx('input', { type: 'text', value: settings.videoUrl, disabled: locked, maxLength: 4096,
+            g.jsxs('label', { className: 'youtube-url-field', children: ['YouTube Video URLs · one per line',
+                g.jsx('textarea', { 'aria-label': 'YouTube Video URL', value: settings.videoUrl, disabled: locked, maxLength: 256000, rows: 3,
                     spellCheck: false, autoComplete: 'off', autoCapitalize: 'none',
-                    placeholder: 'https://www.youtube.com/watch?v=…',
+                    placeholder: 'Paste one YouTube video link per line (up to 100)',
                     onChange: event => setField('videoUrl', event.target.value) })] }),
             g.jsxs('label', { className: 'browser-count-field', children: ['Browsers',
                 g.jsx('input', { type: 'number', min: 1, max: 100, step: 1, value: settings.browserCount,
@@ -195,7 +195,7 @@ function gp() {
             children: `Preparing browsers: ${automation.preparedBrowsers || 0} / ${automation.browserCount}. Stop cancels preparation.` }),
         automation?.lastError && g.jsx('div', { className: 'tracker-error', role: 'alert', children: automation.lastError }),
         g.jsxs('div', { className: 'tracker-note', children: [
-            g.jsx('span', { children: 'Each cycle opens the same video in the selected workspaces. A video that ends waits for the next cycle. Consent, sign-in and playback restrictions remain available for manual action.' }),
+            g.jsx('span', { children: 'Each workspace gets a random video on Start and keeps the same video across cycles. A video that ends waits for the next cycle. Consent, sign-in and playback restrictions remain available for manual action.' }),
             g.jsx('span', { className: 'proxy-tier-note', children: prxUi.providerNote(settings) })
         ] }),
         g.jsxs('div', { className: 'tracker-results', children: [
@@ -221,8 +221,6 @@ function gp() {
         ] })
     ] });
 }
-const wp = { idle: 'Idle', loading: 'Loading', connected: 'Ready', 'proxy-checking': 'Proxy assigned',
-    'proxy-failed': 'Proxy failed', 'no-proxy': 'Waiting for proxy', crashed: 'Crashed' };
 function Sp({ id }) {
     const browser = ye(state => state.browsers[id]);
     const running = ye(state => Boolean(state.automation?.running));
@@ -252,9 +250,13 @@ function Sp({ id }) {
     const proxy = browser.proxy ? `${browser.proxy.protocol}://${browser.proxy.host}:${browser.proxy.port}` : 'No proxy';
     const isTerminal = !playback || ['ended', 'stopped', 'cancelled'].includes(playback.status);
     const disabled = !running || busy || isTerminal;
+    const status = prxUi.browserStatus(browser);
     async function manual(action) {
         setBusy(true);
-        try { await action(); }
+        try {
+            const error = prxUi.playbackControlError(await action());
+            if (error) toast(`Browser ${id}: ${error}`, 'error');
+        }
         catch (error) { toast(`Browser ${id}: ${error.message}`, 'error'); }
         finally { setBusy(false); }
     }
@@ -262,12 +264,10 @@ function Sp({ id }) {
     return g.jsxs('section', { className: 'browser-card', 'data-browser-id': id, children: [
         g.jsxs('header', { className: 'browser-card__header', children: [
             g.jsx('strong', { children: browser.label || `Browser ${id}` }),
-            g.jsx('span', { className: browser.connectionStatus === 'proxy-failed' ? 'status-bad' : prxUi.playbackClass(playback?.status),
-                children: browser.connectionStatus === 'proxy-failed' ? 'Proxy failed'
-                    : playback ? prxUi.playbackLabel(playback.status) : wp[browser.connectionStatus] || browser.connectionStatus })
+            g.jsx('span', { className: status.className, children: status.label })
         ] }),
         g.jsxs('div', { className: 'browser-card__meta', children: [
-            g.jsx('span', { title: proxy, children: proxy }),
+            g.jsx('span', { title: `Proxy transport: ${proxy}`, children: `Proxy transport: ${proxy}` }),
             g.jsx('span', { className: 'browser-position', children: `${prxUi.formatTime(playback?.currentTime)} / ${playback?.isLive ? 'LIVE' : prxUi.formatTime(playback?.duration)}` }),
             g.jsx('button', { className: 'browser-playback-button', disabled: disabled || playback?.status === 'playing',
                 'aria-label': `Play Browser ${id}`, onClick: () => void manual(() => window.app.browser.playVideo(id)), children: 'Play' }),
@@ -277,6 +277,8 @@ function Sp({ id }) {
                 'aria-label': `${playback?.muted ? 'Unmute' : 'Mute'} Browser ${id}`,
                 onClick: () => void manual(() => window.app.browser.setVideoMuted(id, !playback?.muted)), children: playback?.muted ? 'Unmute' : 'Mute' })
         ] }),
+        g.jsx('div', { className: 'browser-card__url', children: `Transport check: ${prxUi.transportCheckLabel(browser.proxyHealthCheck)}` }),
+        g.jsx('div', { className: 'browser-card__url', title: browser.url || 'about:blank', children: `Page: ${browser.url || 'about:blank'}` }),
         g.jsx('div', { className: 'browser-card__viewport', ref: viewport }),
         g.jsx('footer', { className: `browser-card__footer ${prxUi.playbackClass(playback?.status)}`, title: message, children: message })
     ] });

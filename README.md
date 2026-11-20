@@ -1,4 +1,4 @@
-# PRX-YT 1.0.0
+# PRX-YT 1.1.0
 
 PRX-YT is a Windows Electron application for direct YouTube playback testing,
 availability research and diagnostics across isolated browser workspaces.
@@ -12,7 +12,7 @@ PRX-YT development and releases belong exclusively to this repository.
 ## Windows release
 
 Open [PRX-YT releases](https://github.com/0xSkyler/PRX-YT/releases) and download
-`PRX-YT-v1.0.0-Windows-x64-Setup.exe` from the completed v1.0.0 release. A release
+`PRX-YT-v1.1.0-Windows-x64-Setup.exe` from the completed v1.1.0 release. A release
 appears only after its Windows build and validation workflow succeeds. The
 installer supports choosing an installation directory and creates PRX-YT
 shortcuts separately from DOM. It is not Authenticode-signed.
@@ -20,22 +20,24 @@ shortcuts separately from DOM. It is not Authenticode-signed.
 `SHA256SUMS-windows.txt` accompanies the installer. Compare the listed hash with:
 
 ```powershell
-Get-FileHash -Algorithm SHA256 .\PRX-YT-v1.0.0-Windows-x64-Setup.exe
+Get-FileHash -Algorithm SHA256 .\PRX-YT-v1.1.0-Windows-x64-Setup.exe
 ```
 
 ## Run a playback test
 
-1. Enter a **YouTube Video URL**. Watch, `youtu.be`, Shorts and supported live
+1. Paste one or more **YouTube Video URLs**, one per line (up to 100 unique videos). Watch, `youtu.be`, Shorts and supported live
    video links are normalized to a specific video. Channel, playlist-only,
    unrelated and malformed URLs are rejected.
 2. Choose the number of browsers, proxy source, editable API URL, country
    selection, cycle interval and playback mute setting.
-3. Select **Start**. Workspaces prepare with progress and cancellation, receive
-   proxies from the inherited allocation system, and open the video directly.
+3. Select **Start**. Each workspace receives a random video from the list, kept
+   for that run's cycles and recovery. Workspaces prepare progressively with
+   progress and cancellation, receive proxies, check transport and open their selected video directly.
 4. Inspect each workspace's live preview and playback diagnostics. Playback is
    reported from the actual HTML5 media element; navigation alone is not proof
    that the video is playing.
-5. Use **Run Now** to begin the next cycle, or **Stop** to cancel the run. A new
+5. Use **Run Now** to begin the next cycle and explicitly retry held restrictions,
+   or **Stop** to cancel the run. A new
    cycle ends the old playback session before cleanup and navigation.
 
 Videos that finish before a cycle boundary remain ended until the next cycle.
@@ -43,6 +45,20 @@ Long videos remain in the current session until Stop or the next boundary.
 Playback restrictions, login/consent requirements, unavailable videos and media
 errors are visible diagnostics. Use the existing manual browser controls when
 user interaction is required.
+
+CAPTCHA, consent, sign-in and access restrictions are held across scheduled cycles;
+they never trigger automatic proxy rotation. A confirmed proxy transport failure
+immediately removes that endpoint and reserves an unused one from the fetched
+pool, with at most three candidate attempts per workspace per cycle. If the pool
+or attempt budget is exhausted, the slot stops until a later cycle or user retry.
+A HEAD response proves transport only; only advancing media is reported as Playing.
+
+Setup watchdogs cancel stuck work, provider retries back off and stop after three
+attempts, and native renderer crash recovery is bounded. The memory guard checks
+every 15 seconds, pauses after two consecutive pressure samples, and releases
+workspaces. It reserves at least 512 MiB / 10% of system RAM and limits app memory
+to half system RAM, capped at 8 GiB. Reduce the browser count and press Start after
+pressure clears. Log history and proxy quarantine history are bounded.
 
 This application does not use search-engine result scans, target-site clicks,
 automated article scrolling or Keep Alive link navigation for playback research.
@@ -112,7 +128,7 @@ node scripts/smoke-youtube-playback.cjs release-windows/win-unpacked/PRX-YT.exe
 ```
 
 The Windows installer is written to
-`release-windows/PRX-YT-v1.0.0-Windows-x64-Setup.exe`.
+`release-windows/PRX-YT-v1.1.0-Windows-x64-Setup.exe`.
 
 `npm run package:linux` retains the inherited development packaging path.
 Linux native tests require a graphical session or Xvfb and the normal Electron
@@ -122,7 +138,7 @@ system libraries. This release workflow publishes the Windows installer.
 
 The `main` and pull-request validation workflow checks application identity,
 unit tests, source integrity and the bundled Electron Node runtime on Linux and
-Windows. The release workflow runs on `release/v1.0.0` pushes or manual dispatch:
+Windows. The release workflow runs on `release/v1.1.0` pushes or manual dispatch:
 
 1. Verify PRX-YT identity/version and install exact development dependencies.
 2. Run source, unit and bundled-runtime checks.

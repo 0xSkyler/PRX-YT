@@ -1,35 +1,26 @@
-# PRX-YT v1.0.0
+# PRX-YT v1.1.0
 
-PRX-YT adapts DOM v0.5.29 from ProxyDesk's current `main` at
-`b7c3c93ce89d753ad5b25c72ca2f5cabef6fe951` for direct YouTube video playback
-testing, availability research and diagnostics.
+Repairs the v1.0.0 Browser 2 preparation failure and contradictory CAPTCHA/proxy diagnostics. Keeps the dark dashboard, native BrowserView previews, player controls, isolated sessions, provider APIs, country tiers and existing ProxyDesk provenance. All development and publication belong exclusively to PRX-YT.
 
-- Enter one YouTube video URL instead of keywords, a target website or a search engine.
-- Reuse the existing dashboard, browser grid, previews, manual controls,
-  isolated browser profiles and 1–100-workspace configuration.
-- Retain ProxyScrape Free, All Working API, custom provider URLs, country
-  tiers including All Countries, proxy allocation and provider rate-limit recovery.
-- Attempt normal playback and report actual media state, including playback
-  position, buffering, paused, ended, unavailable and blocked states.
-- Preserve Start, Stop, Run Now, centralized cycle timing, cancellation,
-  browser preparation and cleanup. A new cycle replaces the preceding playback session.
+- Paste up to 100 unique YouTube video links, one per line. Each workspace randomly receives one selected video on Start and keeps it through the run's cycles and recovery.
+- Blank-document readiness follows an observed native commit rather than an unsettled full-load promise. Preparation uses two workers, bounded per-slot retries, partial-failure diagnostics and a scaled fleet deadline.
+- Three workers bound assignment, transport checking and recovery. HEAD checks use the selected video through the assigned Electron session; success is not presented as playback.
+- Confirmed failed proxy transports are removed immediately and replaced with an unused endpoint, up to three candidate attempts per workspace per cycle. Exhaustion is reported. CAPTCHA, access limits, login and consent never cause automatic rotation or bypass.
+- CAPTCHA remains a user-action state and survives scheduled cycles until explicit Run Now retry. The UI separately labels proxy transport, actual page URL and media state.
+- Playback requires actual advancing HTML5 media time. Paused, ended, autoplay-blocked, buffering, unavailable, access and media failures retain their own explanations.
+- Bounded setup watchdogs, provider backoff, crash recovery, Stop cancellation, native cleanup barriers, memory-pressure pause/release and bounded logs support sustained diagnostic operation.
 
-## Windows download
+## Download and verification
 
-Use `PRX-YT-v1.0.0-Windows-x64-Setup.exe`. The accompanying
-`SHA256SUMS-windows.txt` records its SHA-256 checksum.
+Download `PRX-YT-v1.1.0-Windows-x64-Setup.exe` and verify it against `SHA256SUMS-windows.txt`.
+The release workflow requires Linux and Windows regression checks, bundled-runtime checks, packaged-source parity, native fixtures on the unpacked application, a clean-directory NSIS installation, installed-app checks and checksum verification. Existing releases are never overwritten.
 
-The publishing workflow requires unit/source checks, bundled-runtime tests,
-archive verification, local native playback fixtures against the unpacked app,
-and a clean NSIS installation followed by installed-app checks.
+See [validation details](https://github.com/0xSkyler/PRX-YT/blob/release/v1.1.0/docs/VALIDATION-1.1.0.md) and the release workflow's validation artifact for measured results and limits.
 
-The installer is not Authenticode-signed. Live YouTube behavior depends on
-connectivity, the selected proxies, the video's availability, media support and
-YouTube's playback/access requirements. A local fixture test does not establish
-that every public proxy or video works. Blocked playback remains a diagnostic
-state requiring appropriate user action.
+## Limits
 
-The inherited Electron 31.2.1 runtime is retained to preserve the existing
-BrowserView architecture. This release does not claim 24/7 stability or that
-100 simultaneous videos are practical on every computer. Use appropriate
-hardware and concurrency for your testing workload.
+One direct live video was tested on the development PC's normal connection. Public proxies remain unvetted and can be unavailable or blocked by YouTube. A local fixture is separate from live proxy transport.
+
+The finite native soak and 100 lightweight workspace preparation do not establish 24-hour uptime or 100 simultaneous continuous video streams. Start with a small fleet and increase within measured CPU, RAM and bandwidth capacity. The memory guard deliberately stops work under sustained pressure; there is no unattended restart after a resource pause or application exit.
+
+The installer is not Authenticode-signed. Electron 31.2.1 is inherited from the BrowserView baseline; this repair does not upgrade the browser engine. Its age and media/security compatibility remain limitations requiring a separately tested runtime migration.

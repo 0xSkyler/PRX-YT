@@ -52,3 +52,11 @@ test('saved settings contain only recognized configuration fields', () => {
         running: true, cycleNumber: 200, secretUnrelatedField: 'not persisted' });
     assert.deepEqual(Object.keys(JSON.parse(storage.getItem(SETTINGS_KEY))).sort(), Object.keys(DEFAULT_SETTINGS).sort());
 });
+
+test('a multiline list beyond the old field length survives application restart', () => {
+    const storage = memoryStorage();
+    const videoUrl = Array.from({ length: 100 }, (_, index) => `https://www.youtube.com/watch?v=${String(index).padStart(11, '0')}&si=${'x'.repeat(100)}`).join('\n');
+    assert.ok(videoUrl.length > 4096);
+    saveSettings(storage, { ...DEFAULT_SETTINGS, videoUrl });
+    assert.equal(readSettings(storage).videoUrl, videoUrl);
+});

@@ -1,0 +1,37 @@
+'use strict';
+const test = require('node:test');
+const assert = require('node:assert/strict');
+const { ResourceWatchdog } = require('../src/main/ResourceWatchdog');
+const GB = 1024 ** 3;
+test('two consecutive low-memory observations pause and shed once, then permit recovery', async () => {
+    const calls = [];
+    const watchdog = new ResourceWatchdog({ onPressure: async message => calls.push(message), log() {} });
+    const healthy = { totalBytes: 16 * GB, freeBytes: 8 * GB, appBytes: GB };
+    await watchdog.sample(healthy);
+    await watchdog.sample({ ...healthy, freeBytes: 100 * 1024 ** 2 });
+    assert.equal(watchdog.pressured, true, 'new work must remain blocked while pressure continues');
+    assert.equal(calls.length, 0, 'a single temporary dip must not stop playback');
+    await watchdog.sample({ ...healthy, freeBytes: 100 * 1024 ** 2 });
+    await watchdog.sample({ ...healthy, freeBytes: 100 * 1024 ** 2 });
+    assert.equal(calls.length, 1);
+    assert.match(calls[0], /memory|Memory/);
+    await watchdog.sample(healthy);
+    assert.equal(watchdog.pressured, false, 'new work can resume after recovery');
+    await watchdog.sample({ ...healthy, appBytes: 9 * GB });
+    await watchdog.sample({ ...healthy, appBytes: 9 * GB });
+    assert.equal(calls.length, 2);
+});
+test('overlapping pressure callbacks are serialized and failures are consumed', async () => {
+    let finish, calls = 0;
+    const watchdog = new ResourceWatchdog({ onPressure: () => { calls++; return new Promise(resolve => { finish = resolve; }); }, log() {} });
+    const pressure = { totalBytes: 8 * GB, freeBytes: 100, appBytes: GB };
+    await watchdog.sample(pressure);
+    const pending = watchdog.sample(pressure);
+    await watchdog.sample(pressure);
+    assert.equal(calls, 1);
+    finish(); await pending;
+    const failed = new ResourceWatchdog({ onPressure: async () => { throw Error('view already gone'); }, log() {} });
+    await failed.sample(pressure);
+    await failed.sample(pressure);
+    assert.equal(failed.busy, false);
+});

@@ -9,6 +9,7 @@ const AllWorkingProxyProvider_1 = require("../proxy/AllWorkingProxyProvider");
 const ProxyScrapeProvider_1 = require("../proxy/ProxyScrapeProvider");
 const ProxyTiers_1 = require("../proxy/ProxyTiers");
 const Logger_1 = require("./Logger");
+const endpointOf = proxy => `${proxy.host.toLowerCase()}:${proxy.port}`;
 exports.PROXY_SOURCE_IDS = Object.freeze({
     allWorking: 'all-working',
     proxyScrapeFree: 'proxyscrape-free'
@@ -43,10 +44,12 @@ class ProxyManager extends node_events_1.EventEmitter {
     assignments = new Map();
     fetchController = null;
     sourceCursors = new Map();
+    failedEndpoints = new Set();
     async init() {
         this.cancelCurrentFetch();
         this.allProxies.clear();
         this.assignments.clear();
+        this.failedEndpoints.clear();
         Logger_1.logger.info('proxy', 'Proxy manager ready: selectable API direct assignment.');
     }
     getAll() {
@@ -68,6 +71,10 @@ class ProxyManager extends node_events_1.EventEmitter {
         this.cancelCurrentFetch();
         const controller = new AbortController();
         this.fetchController = controller;
+        const assertCurrent = () => {
+            if (controller.signal.aborted || this.fetchController !== controller)
+                throw new Error('Proxy API request cancelled.');
+        };
         try {
             const source = resolveProxySource(sourceOptions.source, sourceOptions.endpoint);
             // Tier membership uses provider country metadata only: never ping,
@@ -113,13 +120,17 @@ class ProxyManager extends node_events_1.EventEmitter {
                 // Counts describe parsed provider records, not validated
                 // proxy connections. Never silently switch tiers.
                 this.emit('reloadProgress', { checked: parsed.proxies.length, total: parsed.proxies.length });
+                assertCurrent();
                 onProgress?.(parsed.proxies.length, parsed.proxies.length, 0, 0, parsed.proxies.length);
+                assertCurrent();
                 throw new Error(`${source.label} returned ${parsed.proxies.length} parsed proxies, but none were labeled for ${ProxyTiers_1.PROXY_TIERS[tier].label}. No proxy was assigned outside the selected tier.`);
             }
-            const retained = (sourceOptions.retainedAssignments || []).filter(
+            const retainedSnapshot = sourceOptions.getRetainedAssignments?.() ?? sourceOptions.retainedAssignments ?? [];
+            assertCurrent();
+            const retained = retainedSnapshot.filter(
                 assignment => !tier || (0, ProxyTiers_1.matchesProxyTier)(assignment.proxy?.countryCode, tier));
-            const endpointOf = proxy => `${proxy.host.toLowerCase()}:${proxy.port}`;
             const excluded = new Set([
+                ...this.failedEndpoints,
                 ...retained.map(assignment => endpointOf(assignment.proxy)),
                 ...(sourceOptions.failedProxies || []).map(endpointOf)
             ]);
@@ -156,18 +167,23 @@ class ProxyManager extends node_events_1.EventEmitter {
             // proxies checked for connectivity, latency or geolocation.
             const checked = total;
             this.emit('reloadProgress', { checked, total });
+            assertCurrent();
             onProgress?.(checked, total, orderedProxies.length, assignedCount, total);
+            assertCurrent();
             for (let index = 0; index < assignedCount; index += 1) {
+                assertCurrent();
                 const browserId = browserIds[index];
                 const proxy = orderedProxies[index];
                 this.assignments.set(browserId, proxy);
                 onAssignment({ browserId, proxy }, total, total);
+                assertCurrent();
             }
             for (let index = assignedCount; index < browserIds.length; index += 1) {
                 this.assignments.set(browserIds[index], null);
             }
             const summary = this.summary(browserIds, total, orderedProxies.length, countryMatched.length, tier);
             this.emit('assignmentsChanged', summary);
+            assertCurrent();
             Logger_1.logger.info('proxy', `${source.label}${tier ? ' / ' + ProxyTiers_1.PROXY_TIERS[tier].label : ''}: fetched=${total}, tierMatched=${countryMatched.length}, unique=${orderedProxies.length}, assigned=${assignedCount}/${browserIds.length}, proxyPreflightTests=0.`);
             return summary;
         }
@@ -187,6 +203,22 @@ class ProxyManager extends node_events_1.EventEmitter {
                 proxy: this.assignments.get(browserId) ?? null
             }))
         };
+    }
+    replaceFailedAssignment(browserId, expectedProxy, reserveReplacement = true) {
+        // Identity and the caller's cycle token together reject late failures.
+        if (!expectedProxy || this.assignments.get(browserId) !== expectedProxy) return null;
+        const failed = endpointOf(expectedProxy);
+        this.failedEndpoints.add(failed);
+        // Bound quarantine history for sustained runs with changing public feeds.
+        if (this.failedEndpoints.size > 2000) this.failedEndpoints.delete(this.failedEndpoints.values().next().value);
+        this.assignments.delete(browserId);
+        for (const [id, proxy] of this.allProxies) if (endpointOf(proxy) === failed) this.allProxies.delete(id);
+        const used = new Set([...this.assignments.values()].filter(Boolean).map(endpointOf));
+        const proxy = reserveReplacement && [...this.allProxies.values()].find(candidate =>
+            !used.has(endpointOf(candidate)) && !this.failedEndpoints.has(endpointOf(candidate)));
+        this.assignments.set(browserId, proxy || null);
+        Logger_1.logger.warn('proxy', `Browser ${browserId} failed transport removed; ${proxy ? 'unused replacement reserved' : 'no unused proxy remains'}.`);
+        return proxy ? { browserId, proxy } : null;
     }
 }
 exports.ProxyManager = ProxyManager;

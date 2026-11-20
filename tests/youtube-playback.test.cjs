@@ -228,6 +228,13 @@ test('a browser that leaves the configured video pauses instead of following eng
     assert.ok(f.video.pauseCount > 0);
 });
 
+test('country-specific Google CAPTCHA routes require manual verification without playback attempts', () => {
+    const f = fixture();
+    f.location.href = 'https://www.google.co.uk/sorry/index';
+    assert.equal(f.probe().reason, 'verification');
+    assert.equal(f.video.playCount, 0);
+});
+
 test('cancellation defeats late play fulfillment and stale old-generation commands', async () => {
     const f = fixture(), pending = deferred();
     f.video.playImpl = () => pending.promise;

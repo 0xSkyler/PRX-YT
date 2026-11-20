@@ -77,4 +77,22 @@ function normalizeYouTubeUrl(input) {
     return parseYouTubeUrl(input).url;
 }
 
-module.exports = { normalizeYouTubeUrl, parseYouTubeUrl, parseStartSeconds };
+function normalizeYouTubeUrls(input) {
+    const lines = typeof input === 'string' ? input.split(/\r\n?|\n/) : input;
+    if (!Array.isArray(lines)) throw new Error('Enter one or more YouTube video URLs, one per line.');
+    const urls = new Set();
+    for (let index = 0; index < lines.length; index++) {
+        if (typeof lines[index] === 'string' && !lines[index].trim()) continue;
+        let url;
+        try { url = normalizeYouTubeUrl(lines[index]); }
+        catch (error) { throw new Error(`YouTube URL on line ${index + 1} is invalid: ${error.message}`); }
+        urls.add(url);
+        if (urls.size > 100) throw new Error('Enter at most 100 unique YouTube video URLs.');
+    }
+    if (!urls.size) throw new Error('Enter at least one YouTube video URL.');
+    return [...urls];
+}
+
+const youtubeUrls = Object.freeze({ normalizeYouTubeUrl, normalizeYouTubeUrls, parseYouTubeUrl, parseStartSeconds });
+if (typeof module !== 'undefined' && module.exports) module.exports = youtubeUrls;
+else globalThis.prxYtYouTube = youtubeUrls;

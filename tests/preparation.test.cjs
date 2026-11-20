@@ -85,6 +85,42 @@ test('100 workspaces are prepared with only two native launches in flight and vi
     assert.ok(progress.includes(20));
 });
 
+test('one failed startup slot is retried without abandoning the remaining workspaces', async () => {
+    const browsers = new Map(), attempts = new Map(), failures = [];
+    const manager = {
+        getAll: () => [...browsers.values()],
+        createBrowser: async id => {
+            attempts.set(id, (attempts.get(id) || 0) + 1);
+            if (id === 2) throw new Error('native initialization failed');
+            browsers.set(id, { id });
+        }
+    };
+    const preparation = new BrowserPreparation(manager, { pauseMs: 0, retryDelayMs: 0 });
+    assert.deepEqual(await preparation.ensure(5, { onFailure: (id, error) => failures.push([id, error.message]) }), [1, 3, 4, 5]);
+    assert.equal(attempts.get(2), 3);
+    assert.deepEqual(failures, [[2, 'native initialization failed']]);
+});
+
+test('a transient native startup failure recovers once and preserves the requested IDs', async () => {
+    const browsers = new Map(), attempts = new Map();
+    const manager = {
+        getAll: () => [...browsers.values()],
+        createBrowser: async id => {
+            attempts.set(id, (attempts.get(id) || 0) + 1);
+            if (id === 2 && attempts.get(id) === 1) throw new Error('renderer temporarily busy');
+            browsers.set(id, { id });
+        }
+    };
+    assert.deepEqual(await new BrowserPreparation(manager, { pauseMs: 0, retryDelayMs: 0 }).ensure(3), [1, 2, 3]);
+    assert.equal(attempts.get(2), 2);
+});
+
+test('an exhausted startup reports failure when no workspace can be prepared', async () => {
+    const preparation = new BrowserPreparation({ getAll: () => [], createBrowser: async () => { throw new Error('native startup unavailable'); } },
+        { pauseMs: 0, retryDelayMs: 0 });
+    await assert.rejects(preparation.ensure(1), /native startup unavailable/);
+});
+
 test('cancelled resize does not launch remaining browsers or block a new smaller Start', async () => {
     const browsers = new Map(), gate = deferred(), controller = new AbortController();
     const launched = [];

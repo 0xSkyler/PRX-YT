@@ -2,7 +2,7 @@
 
 const test = require('node:test');
 const assert = require('node:assert/strict');
-const { normalizeYouTubeUrl, parseYouTubeUrl } = require('../src/shared/youtube');
+const { normalizeYouTubeUrl, normalizeYouTubeUrls, parseYouTubeUrl } = require('../src/shared/youtube');
 const id = 'dQw4w9WgXcQ';
 const canonical = `https://www.youtube.com/watch?v=${id}`;
 
@@ -45,4 +45,21 @@ test('arbitrary navigation, lookalike domains, credentials and ambiguous IDs are
         `https://youtube.com/watch?v=${id}&t=-10`, `https://youtu.be/${id}?t=tomorrow`,
         `https://youtu.be/${id}?t=1&t=2`, `https://youtu.be/${id}?start=999999999999999999`
     ]) assert.throws(() => normalizeYouTubeUrl(input), /valid YouTube video URL/, String(input));
+});
+
+test('multiple URLs accept newline input or arrays and deduplicate canonical links', () => {
+    const second = 'https://www.youtube.com/watch?v=abcdefghijk';
+    assert.deepEqual(normalizeYouTubeUrls(`\n https://youtu.be/${id}\r\n${canonical}&si=tracking\n\nhttps://youtube.com/shorts/abcdefghijk `), [canonical, second]);
+    assert.deepEqual(normalizeYouTubeUrls([`https://youtu.be/${id}`, canonical, second]), [canonical, second]);
+});
+
+test('multiple URLs fail all-or-nothing with the original invalid line number', () => {
+    assert.throws(() => normalizeYouTubeUrls(`\n${canonical}\nhttps://evil.example/video`), /line 3.*Only youtube\.com/i);
+    for (const value of ['', '\n\r\n', [], null, {}, [null]]) assert.throws(() => normalizeYouTubeUrls(value), /YouTube/i);
+});
+
+test('multiple URLs retain at most 100 unique canonical links without imposing browser assignments', () => {
+    const urls = Array.from({ length: 101 }, (_, index) => `https://youtu.be/${String(index).padStart(11, '0')}`);
+    assert.equal(normalizeYouTubeUrls(urls.slice(0, 100)).length, 100);
+    assert.throws(() => normalizeYouTubeUrls(urls), /at most 100/i);
 });

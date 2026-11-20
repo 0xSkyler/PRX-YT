@@ -12,6 +12,8 @@ const { YouTubeAutomationManager } = require("./YouTubeAutomationManager");
 const registerIpc_1 = require("./ipc/registerIpc");
 const Logger_1 = require("./Logger");
 const browser_1 = require("../shared/types/browser");
+const os = require('node:os');
+const { ResourceWatchdog } = require('./ResourceWatchdog');
 // Recovered renderer assets are available in both source and packaged runs.
 const isDev = process.env.NODE_ENV === 'development';
 electron_1.app.setName('PRX-YT');
@@ -28,6 +30,8 @@ let shuttingDown = false;
 let shutdownComplete = false;
 let disposeIpc = () => {};
 let browserPreparation;
+let resourceTimer;
+let resourceWatchdog;
 async function createWindowShell() {
     mainWindow = new electron_1.BrowserWindow({
         width: 1600,
@@ -73,6 +77,8 @@ async function loadRenderer() {
 }
 async function ensureBrowserCount(count, options) {
     if (shuttingDown) return [];
+    if (resourceWatchdog?.busy || resourceWatchdog?.pressured)
+        throw new Error('Memory is still under pressure. Wait for recovery and reduce browser count before Start.');
     const ids = await browserPreparation.ensure(count, options);
     activeBrowserCount = ids.length;
     return ids;
@@ -84,6 +90,23 @@ async function bootstrap() {
     browserPreparation = new BrowserPreparation(browserManager);
     activeBrowserCount = 10;
     automationManager = new YouTubeAutomationManager(proxyManager, browserManager, ensureBrowserCount);
+    resourceWatchdog = new ResourceWatchdog({
+        log: message => Logger_1.logger.info('application', message),
+        onPressure: async message => {
+            Logger_1.logger.warn('application', message);
+            automationManager.pauseForResourcePressure(message);
+            // Destroy only native views; retain session profiles and allow Start
+            // to recreate them through the normal preparation/disposal barriers.
+            await Promise.allSettled(browserManager.getAll().map(({ id }) => browserManager.destroyBrowser(id)));
+        }
+    });
+    resourceTimer = setInterval(() => {
+        if (shuttingDown) return;
+        const appBytes = electron_1.app.getAppMetrics().reduce((bytes, metric) =>
+            bytes + (metric.memory.privateBytes ?? metric.memory.workingSetSize ?? 0) * 1024, 0);
+        void resourceWatchdog.sample({ totalBytes: os.totalmem(), freeBytes: os.freemem(), appBytes });
+    }, 15_000);
+    resourceTimer.unref?.();
     // Register IPC before the renderer loads. The previous order allowed the
     // React app to call automation:getState before a handler existed.
     disposeIpc = (0, registerIpc_1.registerIpc)({
@@ -123,6 +146,7 @@ electron_1.app.on('before-quit', (event) => {
     event.preventDefault();
     if (shuttingDown) return;
     shuttingDown = true;
+    clearInterval(resourceTimer);
     automationManager?.stop();
     // A hung Chromium storage operation must not prevent shutdown forever.
     const deadline = setTimeout(() => electron_1.app.exit(0), 10_000);

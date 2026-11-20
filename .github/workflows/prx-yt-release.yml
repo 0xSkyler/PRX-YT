@@ -2,18 +2,33 @@ name: PRX-YT Windows release
 
 on:
   push:
-    branches: [release/v1.0.0]
+    branches: [release/v1.1.0]
   workflow_dispatch:
 
 permissions:
   contents: read
 
 concurrency:
-  group: prx-yt-v1.0.0-release
+  group: prx-yt-v1.1.0-release
   cancel-in-progress: true
 
 jobs:
+  linux:
+    if: github.repository == '0xSkyler/PRX-YT'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+      - run: npm ci --no-audit --no-fund
+      - run: npm test
+      - run: npm run check
+      - run: node scripts/check-bundled-runtime.cjs
   windows:
+    if: github.repository == '0xSkyler/PRX-YT'
     runs-on: windows-latest
     timeout-minutes: 40
     steps:
@@ -23,7 +38,7 @@ jobs:
           node-version: '20'
           cache: npm
       - name: Verify PRX-YT identity and release version
-        run: node -e "const p=require('./package.json');if(p.name!=='prx-yt'||p.productName!=='PRX-YT'||p.version!=='1.0.0'||p.build.appId!=='com.prxyt.desktop')throw Error('Wrong PRX-YT release identity')"
+        run: node -e "const p=require('./package.json');if(p.name!=='prx-yt'||p.productName!=='PRX-YT'||p.version!=='1.1.0'||p.build.appId!=='com.prxyt.desktop')throw Error('Wrong PRX-YT release identity')"
       - run: npm ci --no-audit --no-fund
       - run: npm run check
       - run: npm test
@@ -35,14 +50,17 @@ jobs:
       - name: Exercise the unpacked application with local playback fixtures
         env:
           PRX_YT_SMOKE_SCREENSHOT: release-windows/prx-yt-dashboard.png
+          PRX_YT_NATIVE_FULL_FLEET: '1'
+          PRX_YT_NATIVE_SOAK_SECONDS: '180'
+          PRX_YT_VALIDATION_REPORT: release-windows/prx-yt-native-validation.json
         run: node scripts/smoke-youtube-playback.cjs release-windows/win-unpacked/PRX-YT.exe
       - name: Install into a clean directory
         shell: pwsh
         run: |
-          $installer = (Resolve-Path 'release-windows/PRX-YT-v1.0.0-Windows-x64-Setup.exe').Path
+          $installer = (Resolve-Path 'release-windows/PRX-YT-v1.1.0-Windows-x64-Setup.exe').Path
           $installDir = Join-Path $env:RUNNER_TEMP 'prx-yt-installed'
           if (Test-Path $installDir) { throw 'The installer test directory is not empty' }
-          $process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$installDir" -WindowStyle Hidden -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
           if (!(Test-Path "$installDir/PRX-YT.exe")) { throw 'Installed PRX-YT.exe is missing' }
       - name: Verify installed source and playback behavior
@@ -56,25 +74,28 @@ jobs:
       - name: Checksum the verified Windows installer
         shell: pwsh
         run: |
-          $installerName = 'PRX-YT-v1.0.0-Windows-x64-Setup.exe'
+          $installerName = 'PRX-YT-v1.1.0-Windows-x64-Setup.exe'
           $digest = (Get-FileHash -Algorithm SHA256 "release-windows/$installerName").Hash.ToLowerInvariant()
           "$digest  $installerName" | Set-Content 'release-windows/SHA256SUMS-windows.txt' -Encoding ascii
       - uses: actions/upload-artifact@v4
         with:
-          name: prx-yt-v1.0.0-windows
+          name: prx-yt-v1.1.0-windows
           path: |
-            release-windows/PRX-YT-v1.0.0-Windows-x64-Setup.exe
+            release-windows/PRX-YT-v1.1.0-Windows-x64-Setup.exe
             release-windows/SHA256SUMS-windows.txt
+            release-windows/prx-yt-native-validation.json
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: prx-yt-v1.0.0-validation
-          path: release-windows/prx-yt-*.png
+          name: prx-yt-v1.1.0-validation
+          path: |
+            release-windows/prx-yt-*.png
+            release-windows/prx-yt-*.json
           if-no-files-found: ignore
 
   publish:
-    needs: windows
+    needs: [windows, linux]
     runs-on: ubuntu-latest
     timeout-minutes: 15
     permissions:
@@ -83,13 +104,13 @@ jobs:
       - uses: actions/checkout@v4
       - uses: actions/download-artifact@v4
         with:
-          name: prx-yt-v1.0.0-windows
+          name: prx-yt-v1.1.0-windows
           path: dist/windows
       - name: Verify release metadata and artifact checksum
         shell: bash
         run: |
           set -euo pipefail
-          test "$(node -p "require('./package.json').version")" = '1.0.0'
+          test "$(node -p "require('./package.json').version")" = '1.1.0'
           cd dist/windows
           sha256sum -c SHA256SUMS-windows.txt
       - name: Publish the verified Windows release
@@ -99,13 +120,14 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          if gh release view v1.0.0 >/dev/null 2>&1; then
-            echo 'v1.0.0 already exists; published releases are not overwritten.'
+          if gh release view v1.1.0 >/dev/null 2>&1; then
+            echo 'v1.1.0 already exists; published releases are not overwritten.'
             exit 0
           fi
-          gh release create v1.0.0 \
-            dist/windows/PRX-YT-v1.0.0-Windows-x64-Setup.exe \
+          gh release create v1.1.0 \
+            dist/windows/PRX-YT-v1.1.0-Windows-x64-Setup.exe \
             dist/windows/SHA256SUMS-windows.txt \
+            dist/windows/prx-yt-native-validation.json \
             --target "$GITHUB_SHA" \
-            --title 'PRX-YT v1.0.0 — YouTube playback diagnostics' \
+            --title 'PRX-YT v1.1.0 — YouTube playback diagnostics' \
             --notes-file docs/PRX-YT-RELEASE-NOTES.md

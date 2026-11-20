@@ -52,7 +52,7 @@ function probeYouTubePage(config) {
         pauseVideos();
         return { ...base, kind: 'blocked', reason: 'sign-in', message: 'YouTube requires sign-in or an account choice in this browser.' };
     }
-    if ((/(^|\.)google\.com$/.test(url.hostname) && url.pathname.startsWith('/sorry/')) ||
+    if ((/^(?:www\.)?google\.(?:[a-z]{2,3}|(?:co|com)\.[a-z]{2})$/i.test(url.hostname) && url.pathname.startsWith('/sorry/')) ||
         Array.from(document.querySelectorAll('iframe[src*="recaptcha"], iframe[src*="captcha"], #captcha-form')).some(visible)) {
         pauseVideos();
         return { ...base, kind: 'blocked', reason: 'verification', message: 'Verification or CAPTCHA requires your action in this browser.' };

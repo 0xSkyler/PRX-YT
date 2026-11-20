@@ -11,12 +11,13 @@ test('Start sends the video and complete current form without any SEO inputs', (
     const result = ui.createStartConfig(config({ videoUrl: '  https://youtu.be/abcdefghijk  ',
         browserCount: 100, intervalSec: 30, muted: false, proxyTier: 'all',
         proxyApiUrl: '  https://fixture.example/feed  ' }));
-    assert.equal(result.videoUrl, 'https://youtu.be/abcdefghijk');
+    assert.equal(result.videoUrl, 'https://www.youtube.com/watch?v=abcdefghijk');
+    assert.deepEqual(result.videoUrls, [result.videoUrl]);
     assert.equal(result.proxyApiUrl, 'https://fixture.example/feed');
     assert.equal(result.browserCount, 100);
     assert.equal(result.muted, false);
     assert.equal(result.proxyTier, 'all');
-    assert.deepEqual(Object.keys(result).sort(), ['browserCount', 'intervalSec', 'muted', 'proxyApiUrl', 'proxySource', 'proxyTier', 'videoUrl']);
+    assert.deepEqual(Object.keys(result).sort(), ['browserCount', 'intervalSec', 'muted', 'proxyApiUrl', 'proxySource', 'proxyTier', 'videoUrl', 'videoUrls']);
 });
 
 test('invalid form values fail before creating or replacing browser sessions', () => {
@@ -69,4 +70,41 @@ test('the application components no longer subscribe to SEO events or invoke Kee
     assert.match(application, /onPlaybackResult/);
     assert.match(application, /YouTube Video URL/);
     assert.doesNotMatch(application, /onSeoResult|setKeepAlive|Keywords \(|Target website|Search engine|Max Google pages/);
+});
+
+test('manual controls explain rejected commands and verification has priority over a stale transport label', () => {
+    assert.equal(ui.playbackControlError({ ok: true }), '');
+    assert.match(ui.playbackControlError({ ok: false, reason: 'not-ready' }), /not ready/i);
+    assert.match(ui.playbackControlError({ ok: false, reason: 'inactive' }), /not active/i);
+    assert.equal(ui.browserStatus({ connectionStatus: 'proxy-failed', playback: { status: 'interaction-required' } }).label, 'User action required');
+    assert.equal(ui.browserStatus({ connectionStatus: 'proxy-failed' }).label, 'Proxy transport failed');
+    const bundle = fs.readFileSync(path.join(__dirname, '../src/renderer/assets/index-BZgi7Ish.js'), 'utf8');
+    const application = bundle.slice(bundle.indexOf('// PRX-YT application components.'));
+    assert.match(application, /Proxy transport:/);
+    assert.match(application, /Page:/);
+    assert.match(application, /playbackControlError/);
+});
+
+test('the multiline form validates and sends all canonical videos for random assignment on Start', () => {
+    const result = ui.createStartConfig(config({ videoUrl: 'https://youtu.be/abcdefghijk\nhttps://youtube.com/shorts/dQw4w9WgXcQ\nhttps://youtube.com/watch?v=abcdefghijk' }));
+    assert.deepEqual(result.videoUrls, ['https://www.youtube.com/watch?v=abcdefghijk', 'https://www.youtube.com/watch?v=dQw4w9WgXcQ']);
+    assert.equal(result.videoUrl, result.videoUrls[0]);
+    assert.throws(() => ui.createStartConfig(config({ videoUrl: 'https://youtu.be/abcdefghijk\nhttps://example.com/' })), /line 2/i);
+    const bundle = fs.readFileSync(path.join(__dirname, '../src/renderer/assets/index-BZgi7Ish.js'), 'utf8');
+    const application = bundle.slice(bundle.indexOf('// PRX-YT application components.'));
+    assert.match(application, /g\.jsx\('textarea'/);
+    assert.match(application, /'aria-label': 'YouTube Video URL'/);
+    assert.match(application, /random.*Start.*same.*cycles/i);
+});
+
+test('transport diagnostics show only safe check status and HTTP independently of media playback', () => {
+    assert.equal(ui.transportCheckLabel(), 'Not checked');
+    assert.equal(ui.transportCheckLabel({ status: 'reachable', httpStatus: 200 }), 'Responded · HTTP 200');
+    assert.equal(ui.transportCheckLabel({ status: 'interaction-required', httpStatus: 429 }), 'User action required · HTTP 429');
+    assert.equal(ui.transportCheckLabel({ status: 'failed', httpStatus: 502 }), 'Check failed · HTTP 502');
+    assert.equal(ui.transportCheckLabel({ status: 'attacker text', httpStatus: '200 password=secret', message: 'secret' }), 'Not checked');
+    const bundle = fs.readFileSync(path.join(__dirname, '../src/renderer/assets/index-BZgi7Ish.js'), 'utf8');
+    const application = bundle.slice(bundle.indexOf('// PRX-YT application components.'));
+    assert.match(application, /Transport check:/);
+    assert.match(application, /transportCheckLabel\(browser\.proxyHealthCheck\)/);
 });

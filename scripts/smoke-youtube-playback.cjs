@@ -1,8 +1,8 @@
 'use strict';
 
 // Exercise the shipped application and real Chromium media state. The only
-// injected main-process behavior is an HTTPS fixture on each research session;
-// neither BrowserManager nor the playback controller is replaced or patched.
+// injected main-process behavior is local HTTPS fixtures and one pending native
+// load promise; neither BrowserManager nor the playback controller is replaced.
 // Protocol handling bypasses external transport: resolveProxy assertions verify
 // native routing configuration, not the quality of live public proxies.
 const { _electron } = require('playwright-core');
@@ -14,21 +14,46 @@ const http = require('node:http');
 const { withinDeadline, waitForAutomation, waitForRenderer } = require('./benchmark-state.cjs');
 
 const root = path.resolve(__dirname, '..');
-const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'prx-yt-native-'));
 const target = process.argv[2] ? path.resolve(process.argv[2]) : require('electron');
 const sourceRun = !process.argv[2];
 const VIDEO_ID = 'PRXYTtest01';
+const VIDEO_IDS = [VIDEO_ID, 'PRXYTtest02'];
 const VIDEO_URL = `https://www.youtube.com/watch?v=${VIDEO_ID}`;
 const inputUrl = `https://youtu.be/${VIDEO_ID}?si=native-fixture`;
 const mediaBase64 = fs.readFileSync(path.join(root, 'tests/fixtures/youtube/playback.webm')).toString('base64');
 const servers = [];
 let app, page, phase = 'launch', stderr = '', providerRequests = 0, expectedCycleNumber = null;
 const timings = [];
+const tunnelFailures = [];
 const startedAt = Date.now();
+const soakSeconds = Number(process.env.PRX_YT_NATIVE_SOAK_SECONDS || 0);
+assert.ok(Number.isInteger(soakSeconds) && soakSeconds >= 0 && soakSeconds <= 900,
+    'PRX_YT_NATIVE_SOAK_SECONDS must be a whole number from 0 to 900');
+const profile = fs.mkdtempSync(path.join(os.tmpdir(), 'prx-yt-native-'));
+const fullFleet = process.env.PRX_YT_NATIVE_FULL_FLEET === '1';
+const report = { schema: 1, artifact: sourceRun ? 'source' : path.basename(target),
+    platform: process.platform, startedAt: new Date().toISOString(), requestedSoakSeconds: soakSeconds,
+    fullFleetRequested: fullFleet, scope: 'Local protocol fixtures; zero public YouTube requests; no live proxy transport',
+    memoryMetric: 'Summed per-process working sets; shared pages can be counted more than once',
+    phases: [], resources: [], stopChecks: [], checks: {}, passed: false };
 const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
 function logPhase(next, details = {}) {
     phase = next;
-    console.log(JSON.stringify({ nativeSmokeStage: phase, elapsedMs: Date.now() - startedAt, ...details }));
+    const event = { nativeSmokeStage: phase, elapsedMs: Date.now() - startedAt, ...details };
+    report.phases.push(event);
+    console.log(JSON.stringify(event));
+}
+async function sampleResources(label) {
+    const value = await app.evaluate(({ app, webContents }) => {
+        const metrics = app.getAppMetrics();
+        return { processes: metrics.length, nativeContents: webContents.getAllWebContents().filter(wc => !wc.isDestroyed()).length,
+            workingSetBytes: metrics.reduce((total, item) => total + (item.memory?.workingSetSize || 0) * 1024, 0),
+            cpuPercent: metrics.reduce((total, item) => total + (item.cpu?.percentCPUUsage || 0), 0) };
+    });
+    const sample = { label, elapsedMs: Date.now() - startedAt, freeMemoryBytes: os.freemem(), ...value };
+    report.resources.push(sample);
+    assert.ok(sample.freeMemoryBytes > 768 * 1024 * 1024, 'Native validation stopped below 768 MiB free system memory');
+    return sample;
 }
 async function assertHealthyCycle(expectedCycle = expectedCycleNumber) {
     const state = await page.evaluate(() => window.app.automation.getState());
@@ -50,7 +75,10 @@ async function waitForCycle(expected, timeoutMs = 30_000) {
 async function serve(handler) {
     const server = http.createServer(handler);
     // No request is forwarded. An accidental external tunnel fails locally.
-    server.on('connect', (_request, socket) => socket.end('HTTP/1.1 502 Fixture has no upstream\r\nContent-Length: 0\r\n\r\n'));
+    server.on('connect', (request, socket) => {
+        tunnelFailures.push({ proxyPort: server.address().port, target: request.url, at: Date.now() });
+        socket.end('HTTP/1.1 502 Fixture has no upstream\r\nContent-Length: 0\r\n\r\n');
+    });
     servers.push(server);
     await new Promise((resolve, reject) => {
         server.once('error', reject);
@@ -84,20 +112,21 @@ async function launch() {
 }
 
 async function installResearchFixtures() {
-    await app.evaluate(({ session }, { mediaBase64, videoId }) => {
+    await app.evaluate(({ session }, { mediaBase64, videoIds }) => {
         const clip = Buffer.from(mediaBase64, 'base64');
         globalThis.__prxYtFixture = { modes: {}, expectedCycle: 1, requests: [], documents: 0,
-            documentRecords: [], unfinishedResponses: 0, rejectedRequests: [] };
+            documentRecords: [], unfinishedResponses: 0, rejectedRequests: [], pendingBlankPromises: 0, headStatuses: {}, handlers: {} };
         const fixture = globalThis.__prxYtFixture;
         for (let id = 1; id <= 100; id++) {
             const ses = session.fromPartition(`persist:browser-${id}`);
-            ses.protocol.handle('https', request => {
+            const handler = request => {
                 const url = new URL(request.url);
                 if (url.hostname !== 'www.youtube.com') {
                     fixture.rejectedRequests.push(request.url);
                     return new Response('No upstream network in native fixture', { status: 502 });
                 }
-                fixture.requests.push({ browserId: id, url: request.url, at: Date.now() });
+                fixture.requests.push({ browserId: id, url: request.url, method: request.method, at: Date.now() });
+                if (request.method === 'HEAD') return new Response(null, { status: fixture.headStatuses[id] || 200 });
                 if (url.pathname === '/__prx_fixture__/unfinished.png') {
                     fixture.unfinishedResponses++;
                     // A valid PNG prefix with no end deliberately keeps page
@@ -121,19 +150,21 @@ async function installResearchFixtures() {
                             ...(range ? { 'Content-Range': `bytes ${first}-${last}/${clip.length}` } : {}) }
                     });
                 }
-                if (url.pathname !== '/watch' || url.searchParams.get('v') !== videoId) {
+                if (url.pathname !== '/watch' || !videoIds.includes(url.searchParams.get('v'))) {
                     return new Response('Unexpected YouTube navigation', { status: 404 });
                 }
                 const mode = fixture.modes[id] || 'normal';
                 const documentId = ++fixture.documents;
                 const expectedCycle = fixture.expectedCycle;
-                fixture.documentRecords.push({ browserId: id, documentId, mode, expectedCycle, at: Date.now() });
+                fixture.documentRecords.push({ browserId: id, documentId, videoId: url.searchParams.get('v'), mode, expectedCycle, at: Date.now() });
+                if (mode === 'lightweight') return new Response('<!doctype html><title>Local native workspace</title><p>Isolated lightweight workspace</p>',
+                    { headers: { 'Content-Type': 'text/html', 'Cache-Control': 'no-store' } });
                 return new Response(`<!doctype html><html><head><meta charset="utf-8"><link rel="icon" href="data:,"><title>PRX-YT native fixture</title>
                     <style>body{margin:0;background:#15181e;color:white;font:14px sans-serif}video{width:100%;height:160px}.ytp-error-content-wrap{padding:20px}</style></head>
                     <body><main id="movie_player"><video class="html5-main-video" controls preload="auto" src="/__prx_fixture__/playback.webm"></video></main>
                     <img src="/__prx_fixture__/unfinished.png" width="1" height="1" alt="">
                     <script>
-                    window.fixture = { browserId: ${id}, documentId: ${documentId}, expectedCycle: ${expectedCycle}, mode: ${JSON.stringify(mode)},
+                    window.fixture = { browserId: ${id}, documentId: ${documentId}, videoId: ${JSON.stringify(url.searchParams.get('v'))}, expectedCycle: ${expectedCycle}, mode: ${JSON.stringify(mode)},
                         beforeStorage: localStorage.getItem('prx-fixture-session'), playCount: 0, endedCount: 0 };
                     localStorage.setItem('prx-fixture-session', String(${id}));
                     const video = document.querySelector('video');
@@ -151,13 +182,22 @@ async function installResearchFixtures() {
                         error.textContent = 'This video is unavailable.';
                         document.getElementById('movie_player').appendChild(error);
                     };
+                    window.fixture.showCaptcha = () => {
+                        video.pause();
+                        const form = document.createElement('form'); form.id = 'captcha-form';
+                        form.textContent = 'Verification or CAPTCHA requires your action.';
+                        document.body.appendChild(form);
+                    };
                     if (window.fixture.mode === 'unavailable') window.fixture.showUnavailable();
+                    if (window.fixture.mode === 'captcha') window.fixture.showCaptcha();
                     </script></body></html>`, {
                     headers: { 'Content-Type': 'text/html; charset=utf-8', 'Cache-Control': 'no-store' }
                 });
-            });
+            };
+            fixture.handlers[id] = handler;
+            ses.protocol.handle('https', handler);
         }
-    }, { mediaBase64, videoId: VIDEO_ID });
+    }, { mediaBase64, videoIds: VIDEO_IDS });
 }
 
 async function browserStates() { return page.evaluate(() => window.app.browser.getAll()); }
@@ -181,7 +221,7 @@ async function mediaSnapshot(ids = [1, 2]) {
             const value = await wc.mainFrame.executeJavaScript(`(() => {
                 const video = document.querySelector('video');
                 return { browserId: ${id}, url: location.href, fixture: window.fixture ? { browserId: window.fixture.browserId,
-                    documentId: window.fixture.documentId, expectedCycle: window.fixture.expectedCycle, mode: window.fixture.mode,
+                    documentId: window.fixture.documentId, videoId: window.fixture.videoId, expectedCycle: window.fixture.expectedCycle, mode: window.fixture.mode,
                     beforeStorage: window.fixture.beforeStorage,
                     playCount: window.fixture.playCount, endedCount: window.fixture.endedCount } : null,
                     localStorage: location.protocol === 'https:' ? localStorage.getItem('prx-fixture-session') : null,
@@ -205,7 +245,7 @@ async function startFleet(count) {
         assert.equal(value.lastError, undefined, `Fleet startup failed: ${value.lastError}`);
         return value.running && !value.preparingBrowsers && !value.cycleInProgress &&
             value.cycleNumber >= 1 && value.assignedBrowsers === expected;
-    }, count, { timeoutMs: 40_000 });
+    }, count, { timeoutMs: count === 100 ? 120_000 : 40_000 });
     assert.equal(state.lastError, undefined);
     assert.equal(state.cycleNumber, 1, 'Initial cycle did not settle before the next boundary');
     expectedCycleNumber = 1;
@@ -214,16 +254,24 @@ async function startFleet(count) {
     const live = await app.evaluate(({ webContents }) => webContents.getAllWebContents().filter(wc => !wc.isDestroyed()).length);
     assert.equal(live, count + 1, 'Resizing leaked a native browser');
     timings.push({ browserCount: count, preparationMs: Date.now() - start });
+    await sampleResources(`${count}-browser first cycle`);
     logPhase(`${count}-browser first cycle ready`, { cycleNumber: state.cycleNumber, assignedBrowsers: state.assignedBrowsers, providerRequests });
     return state;
 }
 async function stopFleet() {
     logPhase('stopping playback', { expectedCycleNumber });
     expectedCycleNumber = null;
+    const stopAt = Date.now();
     await page.getByRole('button', { name: 'Stop', exact: true }).click();
     await waitForAutomation(page, state => !state.running && !state.preparingBrowsers);
     await page.getByRole('button', { name: 'Start', exact: true }).waitFor({ state: 'visible' });
     await page.waitForFunction(() => !Array.from(document.querySelectorAll('button')).find(b => b.textContent === 'Start')?.disabled);
+    const ids = (await browserStates()).map(state => state.id);
+    await withinDeadline((async () => {
+        while (!(await mediaSnapshot(ids)).every(value => value.absent || (value.url === 'about:blank' && value.media === null))) await sleep(100);
+    })(), 20_000, 'Stop must release every local media document');
+    report.stopChecks.push({ browserCount: ids.length, elapsedMs: Date.now() - stopAt, allDocumentsReleased: true, activeMediaElements: 0 });
+    timings.push({ operation: 'stop', elapsedMs: Date.now() - stopAt });
 }
 
 async function run() {
@@ -279,6 +327,8 @@ async function run() {
     await waitForBrowsers(states => states.length === 2 && states.every(state => state.playback?.status === 'playing' && state.playback.currentTime > 0), 'Actual media playback');
     const first = await mediaSnapshot();
     assert.ok(first.every(value => value.fixture.expectedCycle === firstState.cycleNumber && value.fixture.mode === 'normal'));
+    assert.ok((await browserStates()).every(state => state.proxyHealthCheck?.httpStatus === 200 && state.proxyHealthCheck.status === 'reachable'),
+        'Successful native HEAD transport checks were not recorded separately from real media');
     logPhase('initial media verified', { documents: first.map(value => value.fixture), positions: first.map(value => value.media.currentTime) });
     if (process.env.PRX_YT_SMOKE_SCREENSHOT) await page.screenshot({
         path: path.resolve(process.env.PRX_YT_SMOKE_SCREENSHOT.replace(/\.png$/, '-playing.png'))
@@ -315,6 +365,19 @@ async function run() {
     const requestsBeforeCycle = providerRequests;
     const beforeManual = await assertHealthyCycle(1);
     const manualCycle = beforeManual.cycleNumber + 1;
+    logPhase('Browser 2 pending about:blank promise regression');
+    await app.evaluate(({ session, webContents }) => {
+        const wc = webContents.getAllWebContents().find(value => value.session === session.fromPartition('persist:browser-2'));
+        const nativeLoad = wc.loadURL.bind(wc);
+        wc.loadURL = (url, ...args) => {
+            const loading = nativeLoad(url, ...args);
+            if (url !== 'about:blank') return loading;
+            wc.loadURL = nativeLoad;
+            globalThis.__prxYtFixture.pendingBlankPromises++;
+            loading.catch(() => {});
+            return new Promise(() => {});
+        };
+    });
     await app.evaluate((_electron, cycle) => {
         globalThis.__prxYtFixture.modes[2] = 'blocked';
         globalThis.__prxYtFixture.expectedCycle = cycle;
@@ -335,6 +398,9 @@ async function run() {
     assert.deepEqual(second.map(value => value.fixture.mode), ['normal', 'blocked']);
     logPhase('manual cycle media verified', { cycleNumber: manualCycle, documents: second.map(value => value.fixture) });
     assert.ok(second.every(value => value.fixture.beforeStorage === null), 'Cycle cleanup retained outgoing page storage');
+    assert.equal(await app.evaluate(() => globalThis.__prxYtFixture.pendingBlankPromises), 1,
+        'The Browser 2 pending about:blank regression was not exercised');
+    report.checks.pendingBlankCommit = true;
     assert.ok(second.every((value, index) => value.fixture.documentId !== first[index].fixture.documentId), 'Cycle reused its old document');
     assert.ok(second[0].media.currentTime < ended[0].media.currentTime, 'Cycle did not reset playback position');
     assert.equal(second[1].fixture.playCount, 1);
@@ -371,6 +437,32 @@ async function run() {
     assert.ok(third.every(value => value.fixture.expectedCycle === scheduledCycle && value.fixture.mode === 'normal'));
     assert.ok(third.every((value, index) => value.fixture.beforeStorage === null && value.fixture.documentId !== second[index].fixture.documentId));
     logPhase('scheduled cycle media verified', { cycleNumber: scheduledCycle, documents: third.map(value => value.fixture) });
+    logPhase('CAPTCHA held without contradictory transport failure');
+    await app.evaluate(async ({ session, webContents }) => {
+        const wc = webContents.getAllWebContents().find(value => value.session === session.fromPartition('persist:browser-2'));
+        await wc.mainFrame.executeJavaScript('window.fixture.showCaptcha()', false);
+    });
+    await waitForBrowsers(states => states[1].playback?.status === 'interaction-required', 'CAPTCHA diagnostic');
+    const captchaCard = page.locator('.browser-card').filter({ has: page.getByText('Browser 2', { exact: true }) });
+    assert.equal(await captchaCard.count(), 1, 'Browser 2 diagnostic card was not found');
+    assert.equal(await captchaCard.getByText('Proxy failed', { exact: true }).count(), 0,
+        'A reached CAPTCHA was mislabeled as a proxy transport failure');
+    const heldDocument = (await mediaSnapshot([2]))[0].fixture.documentId;
+    await app.evaluate((_electron, cycle) => { globalThis.__prxYtFixture.expectedCycle = cycle; }, scheduledCycle + 1);
+    await waitForCycle(scheduledCycle + 1, 45_000);
+    expectedCycleNumber = scheduledCycle + 1;
+    assert.equal((await mediaSnapshot([2]))[0].fixture.documentId, heldDocument,
+        'A scheduled cycle navigated a CAPTCHA that requires manual action');
+    await app.evaluate(async ({ session, webContents }) => {
+        const wc = webContents.getAllWebContents().find(value => value.session === session.fromPartition('persist:browser-2'));
+        await wc.mainFrame.executeJavaScript('document.getElementById("captcha-form").remove()', false);
+    });
+    await app.evaluate((_electron, cycle) => { globalThis.__prxYtFixture.expectedCycle = cycle; }, scheduledCycle + 2);
+    await page.getByRole('button', { name: 'Run Now', exact: true }).click();
+    await waitForCycle(scheduledCycle + 2);
+    expectedCycleNumber = scheduledCycle + 2;
+    await waitForBrowsers(states => states.every(state => state.playback?.status === 'playing'), 'Manual retry after CAPTCHA');
+    report.checks.captchaHeldUntilManualRetry = true;
     await stopFleet();
     await waitForBrowsers(states => states.every(state => state.playback?.status === 'stopped'), 'Stop diagnostics');
     await withinDeadline((async () => {
@@ -395,7 +487,115 @@ async function run() {
     await startFleet(20);
     await waitForBrowsers(states => states.length === 20 && states.every(state =>
         ['playing', 'ended'].includes(state.playback?.status) && state.playback.currentTime > 0), 'Playback after cancelled preparation');
+    if (soakSeconds) {
+        logPhase('bounded local media soak', { browserCount: 20, seconds: soakSeconds });
+        await stopFleet();
+        await page.getByLabel('Cycle interval (sec)', { exact: true }).fill('30');
+        await startFleet(20);
+        expectedCycleNumber = null;
+        const soakAt = Date.now();
+        let advancingMediaSamples = 0;
+        while (Date.now() - soakAt < soakSeconds * 1000) {
+            await assertHealthyCycle(null);
+            const states = await browserStates();
+            assert.equal(states.length, 20);
+            assert.ok(states.every(state => !['error', 'playback-error', 'interaction-required'].includes(state.playback?.status)),
+                'Local media soak encountered a failed workspace');
+            advancingMediaSamples += states.filter(state => state.playback?.status === 'playing' && state.playback.currentTime > 0).length;
+            await sampleResources('20-video soak');
+            await sleep(Math.min(5000, Math.max(0, soakSeconds * 1000 - (Date.now() - soakAt))));
+        }
+        const soaked = await assertHealthyCycle(null);
+        report.checks.soak = { seconds: (Date.now() - soakAt) / 1000, browserCount: 20, cyclesCompleted: soaked.cycleNumber,
+            rendering: 'software', fixtureVideoSeconds: 7, scheduledCycleSeconds: 30, advancingMediaSamples };
+        assert.ok(advancingMediaSamples >= 20, 'The bounded soak did not observe actual advancing media in the 20-video fleet');
+    }
     await stopFleet();
+    if (fullFleet) {
+        assert.ok(os.freemem() > 3 * 1024 ** 3, 'Full native fleet requires at least 3 GiB free system memory');
+        logPhase('full 100 native lightweight workspaces');
+        await page.getByLabel('Cycle interval (sec)', { exact: true }).fill('600');
+        await app.evaluate(() => { for (let id = 1; id <= 100; id++) globalThis.__prxYtFixture.modes[id] = 'lightweight'; });
+        await startFleet(100);
+        await sampleResources('100 native lightweight workspaces');
+        await sleep(5000);
+        await assertHealthyCycle(1);
+        const preparedIds = (await browserStates()).map(state => state.id);
+        assert.deepEqual(preparedIds, Array.from({ length: 100 }, (_, index) => index + 1));
+        report.checks.fullNativeFleet = { browserCount: 100, preparedIds, idleHoldSeconds: 5, localMediaPlayback: false };
+        await stopFleet();
+        await app.evaluate(() => { globalThis.__prxYtFixture.modes = {}; });
+        await startFleet(20);
+        await waitForBrowsers(states => states.every(state => ['playing', 'ended'].includes(state.playback?.status)), '20-video recovery after 100 workspaces');
+        await stopFleet();
+    }
+    logPhase('multiple pasted videos keep stable random workspace assignments');
+    const multiUrls = VIDEO_IDS.map(id => `https://www.youtube.com/watch?v=${id}`);
+    await input.fill(multiUrls.join('\n'));
+    await startFleet(20);
+    await waitForBrowsers(states => states.length === 20 && states.every(state =>
+        ['playing', 'ended'].includes(state.playback?.status) && state.playback.currentTime > 0), 'Randomly distributed local media');
+    const multiIds = Array.from({ length: 20 }, (_, index) => index + 1);
+    const assigned = await mediaSnapshot(multiIds);
+    assert.ok(assigned.every(value => multiUrls.includes(value.url)), 'A workspace navigated outside the pasted video set');
+    await app.evaluate(() => { globalThis.__prxYtFixture.expectedCycle = 2; });
+    await page.getByRole('button', { name: 'Run Now', exact: true }).click();
+    await waitForCycle(2);
+    expectedCycleNumber = 2;
+    await waitForBrowsers(states => states.every(state => ['playing', 'ended'].includes(state.playback?.status) && state.playback.currentTime > 0),
+        'Playback after multi-video cycle reset');
+    const reassigned = await mediaSnapshot(multiIds);
+    assert.deepEqual(reassigned.map(value => value.url), assigned.map(value => value.url), 'A cycle changed a workspace random video assignment');
+    assert.ok(reassigned.every((value, index) => value.fixture.documentId !== assigned[index].fixture.documentId), 'A multi-video cycle reused an old document');
+    report.checks.multipleVideos = { providedVideos: multiUrls, assignments: assigned.map(value => ({ browserId: value.browserId, videoId: value.fixture.videoId })), stableAfterCycle: true };
+    await stopFleet();
+    await input.fill(inputUrl);
+    logPhase('real Chromium tunnel failure uses one unused local replacement');
+    const tunnelsBefore = tunnelFailures.length;
+    await app.evaluate(({ session }) => {
+        const ses = session.fromPartition('persist:browser-1');
+        const fixture = globalThis.__prxYtFixture;
+        ses.protocol.unhandle('https');
+        ses.webRequest.onErrorOccurred(details => {
+            if (details.url !== 'https://www.youtube.com/watch?v=PRXYTtest01') return;
+            fixture.nativeTunnelFailure = { error: details.error, url: details.url, at: Date.now() };
+            ses.webRequest.onErrorOccurred(null);
+            ses.protocol.handle('https', fixture.handlers[1]);
+        });
+    });
+    await startFleet(1);
+    await waitForBrowsers(states => states.length === 1 && states[0].playback?.status === 'playing' && states[0].playback.currentTime > 0,
+        'Playback through the replacement routing configuration');
+    const nativeFailure = await app.evaluate(() => globalThis.__prxYtFixture.nativeTunnelFailure);
+    assert.match(nativeFailure?.error || '', /ERR_TUNNEL_|ERR_PROXY_|ERR_SOCKS_/,
+        'The replacement fixture did not exercise a real Chromium proxy transport failure');
+    const actualTunnels = tunnelFailures.slice(tunnelsBefore);
+    assert.ok(actualTunnels.length > 0 && actualTunnels.every(value => value.proxyPort === actualTunnels[0].proxyPort && value.target === 'www.youtube.com:443'),
+        'The native transport failure fixture used unexpected proxy routes or destinations');
+    const replacementRoute = await app.evaluate(({ session }, url) => session.fromPartition('persist:browser-1').resolveProxy(url), VIDEO_URL);
+    const failedRoute = `PROXY 127.0.0.1:${actualTunnels[0].proxyPort}`;
+    assert.notEqual(replacementRoute, failedRoute, 'A failed native proxy was reused');
+    assert.equal((await mediaSnapshot([1]))[0].url, VIDEO_URL, 'Proxy recovery changed the assigned video');
+    report.checks.nativeProxyReplacement = { nativeError: nativeFailure.error, failedRoute, replacementRoute,
+        videoUrl: VIDEO_URL, publicRequests: 0, proxyTunnelAttempts: actualTunnels.length, advancingLocalMedia: true };
+    await stopFleet();
+    logPhase('HTTP 403 and 429 transport restrictions remain distinct from playback');
+    await app.evaluate(() => {
+        globalThis.__prxYtFixture.headStatuses = { 1: 403, 2: 429 };
+        globalThis.__prxYtFixture.modes = { 1: 'captcha', 2: 'captcha' };
+    });
+    await startFleet(20);
+    const restricted = await waitForBrowsers(states => states.slice(0, 2).every(state => state.playback?.status === 'interaction-required'),
+        'Native HTTP restriction diagnostics');
+    const restrictedMedia = await mediaSnapshot([1, 2]);
+    assert.deepEqual(restricted.slice(0, 2).map(state => state.proxyHealthCheck?.httpStatus), [403, 429]);
+    assert.ok(restricted.slice(0, 2).every(state => state.proxyHealthCheck?.status === 'interaction-required' && state.connectionStatus !== 'proxy-failed'));
+    assert.ok(restrictedMedia.every(value => value.fixture.playCount === 0 && value.media.paused), 'A CAPTCHA fixture received a playback attempt');
+    report.checks.transportRestrictions = restricted.slice(0, 2).map((state, index) => ({ browserId: state.id,
+        httpStatus: state.proxyHealthCheck.httpStatus, transportStatus: state.proxyHealthCheck.status,
+        playbackStatus: state.playback.status, playAttempts: restrictedMedia[index].fixture.playCount }));
+    await stopFleet();
+    await app.evaluate(() => { globalThis.__prxYtFixture.headStatuses = {}; globalThis.__prxYtFixture.modes = {}; });
     const preparation = await page.evaluate(() => window.__prxPreparation);
     assert.ok(preparation.some(value => value.count === 20 && value.ready > 2 && value.ready < 20));
     const trace = await app.evaluate(() => globalThis.__prxYtFixture);
@@ -405,6 +605,7 @@ async function run() {
     assert.ok(trace.requests.every(request => ['/watch', '/__prx_fixture__/playback.webm', '/__prx_fixture__/unfinished.png'].includes(new URL(request.url).pathname)));
 
     logPhase('settings persistence and graceful restart');
+    await page.getByLabel('Cycle interval (sec)', { exact: true }).fill('600');
     await page.waitForFunction(() => JSON.parse(localStorage.getItem('prx-yt.settings.v1'))?.browserCount === 20);
     const saved = await page.evaluate(() => JSON.parse(localStorage.getItem('prx-yt.settings.v1')));
     assert.equal(saved.videoUrl, inputUrl);
@@ -422,6 +623,8 @@ async function run() {
     assert.equal((await page.evaluate(() => window.app.automation.getState())).running, false);
     if (process.env.PRX_YT_SMOKE_SCREENSHOT) await page.screenshot({ path: path.resolve(process.env.PRX_YT_SMOKE_SCREENSHOT) });
     await app.close(); app = null;
+    report.passed = true;
+    report.checks.smoke = true;
     console.log(JSON.stringify({
         artifact: sourceRun ? 'source' : path.basename(target), realHtml5Video: true,
         playbackProgress: true, playbackBeforeFullPageLoad: true, naturalEndingWithoutReplay: true, manualControls: true,
@@ -435,6 +638,7 @@ async function run() {
 }
 
 run().catch(async error => {
+    report.error = { phase, message: error.message };
     console.error(`YouTube native smoke failed during ${phase}: ${error.stack || error}`);
     if (app) {
         if (page && process.env.PRX_YT_SMOKE_SCREENSHOT) {
@@ -464,4 +668,11 @@ run().catch(async error => {
         await new Promise(resolve => server.close(resolve));
     }
     fs.rmSync(profile, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    report.elapsedMs = Date.now() - startedAt;
+    report.timings = timings;
+    if (process.env.PRX_YT_VALIDATION_REPORT) {
+        const output = path.resolve(process.env.PRX_YT_VALIDATION_REPORT);
+        fs.mkdirSync(path.dirname(output), { recursive: true });
+        fs.writeFileSync(output, JSON.stringify(report, null, 2) + '\n');
+    }
 });

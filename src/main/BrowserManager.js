@@ -19,7 +19,8 @@ const { inspectSiteCookieConsent, installSiteCookieConsentObserver, inspectGoogl
 const Logger_1 = require("./Logger");
 const { withTimeout, waitForPreparation, preparationCancelled } = require("./runtime");
 const { YouTubePlaybackController } = require('./YouTubePlaybackController');
-const { normalizeYouTubeUrl } = require('../shared/youtube');
+const { normalizeYouTubeUrl, parseYouTubeUrl } = require('../shared/youtube');
+const { checkProxyHealth } = require('./ProxyHealthCheck');
 /**
  * If `url` is Google's "unusual traffic" / CAPTCHA interstitial
  * (`google.<tld>/sorry/...`), returns the page it was guarding — pulled
@@ -54,6 +55,28 @@ function isGoogleConsentUrl(value) {
         const url = new URL(value);
         return /^https?:$/.test(url.protocol) && /^consent\.google\.(?:[a-z]{2,3}|(?:co|com)\.[a-z]{2})$/i.test(url.hostname);
     } catch { return false; }
+}
+function isYouTubeNavigationAllowed(value, videoUrl) {
+    try {
+        const url = new URL(value);
+        if (url.href === 'about:blank') return true;
+        if (!videoUrl) return false;
+        if (url.protocol !== 'https:' || url.username || url.password || url.port) return false;
+        if (/^consent\.(youtube|google)\.com$/.test(url.hostname) || url.hostname === 'accounts.google.com') return true;
+        if (/^(?:www\.)?google\.(?:[a-z]{2,3}|(?:co|com)\.[a-z]{2})$/i.test(url.hostname) && url.pathname.startsWith('/sorry/')) return true;
+        return Boolean(videoUrl) && parseYouTubeUrl(value).videoId === parseYouTubeUrl(videoUrl).videoId;
+    } catch { return false; }
+}
+function isProxyTransportError(error) {
+    return /ERR_PROXY_|ERR_TUNNEL_CONNECTION_FAILED|ERR_SOCKS_CONNECTION_FAILED/i.test(error || '');
+}
+function safeNavigationUrl(value) {
+    try {
+        const url = new URL(value);
+        if (['youtube.com', 'www.youtube.com', 'm.youtube.com'].includes(url.hostname))
+            return normalizeYouTubeUrl(value);
+        return url.origin + url.pathname;
+    } catch { return 'unavailable'; }
 }
 // eslint-disable-next-line @typescript-eslint/no-unsafe-declaration-merging -- standard Node EventEmitter typed-events pattern
 class BrowserManager extends node_events_1.EventEmitter {
@@ -126,6 +149,9 @@ class BrowserManager extends node_events_1.EventEmitter {
     async createBrowserOwned(id, options) {
         const { signal } = options;
         if (signal?.aborted) throw preparationCancelled();
+        if (this.workflow === 'youtube' && options.startPage !== 'about:blank') {
+            throw new Error('YouTube workspaces must start with a blank document.');
+        }
         await waitForPreparation(this.disposing.get(id), this.preparationTimeoutMs, signal,
             `Browser ${id} cleanup timed out. Stop and retry with fewer browsers.`);
         if (this.disposed || signal?.aborted) throw preparationCancelled();
@@ -169,6 +195,7 @@ class BrowserManager extends node_events_1.EventEmitter {
             partition,
             session: ses,
             state,
+            options,
             proxyHealth: { googleReached: false, targetOpened: false, captchaSeen: false, failed: false },
             popupWindows: new Set(),
             proxyRoutingReady: false,
@@ -190,8 +217,12 @@ class BrowserManager extends node_events_1.EventEmitter {
         const startUrl = normalizeUrl(options.startPage);
         try {
             this.window?.addBrowserView(view);
-            await waitForPreparation(view.webContents.loadURL(startUrl), this.preparationTimeoutMs, signal,
-                `Browser ${id} initialization timed out. Try fewer browsers or retry Start.`);
+            if (this.workflow === 'youtube') await this.loadBlankDocument(managed, {
+                signal, timeoutMs: this.preparationTimeoutMs,
+                message: `Browser ${id} initialization timed out. Try fewer browsers or retry Start.`
+            });
+            else await waitForPreparation(view.webContents.loadURL(startUrl), this.preparationTimeoutMs, signal,
+                    `Browser ${id} initialization timed out. Try fewer browsers or retry Start.`);
             if (this.disposed || signal?.aborted) throw preparationCancelled();
         } catch (error) {
             // Close a partial renderer immediately. Waiting for its own creating
@@ -207,6 +238,18 @@ class BrowserManager extends node_events_1.EventEmitter {
     wireEvents(managed, options) {
         const { view, id } = managed;
         const wc = view.webContents;
+        if (this.workflow === 'youtube') {
+            const guardNavigation = (event, url, _isInPlace, isMainFrame = true) => {
+                if (!isMainFrame || isYouTubeNavigationAllowed(url, managed.playbackConfig?.videoUrl)) return;
+                event.preventDefault();
+                this.updateState(managed, { playback: {
+                    ...managed.state.playback, status: 'interaction-required', code: 'navigation-blocked',
+                    message: 'Navigation outside the configured YouTube video was blocked.', observedAt: new Date().toISOString()
+                } });
+            };
+            wc.on('will-navigate', guardNavigation);
+            wc.on('will-redirect', guardNavigation);
+        }
         wc.on('did-frame-finish-load', () => {
             if (this.workflow === 'youtube') return;
             for (const frame of wc.mainFrame?.framesInSubtree ?? []) {
@@ -346,7 +389,7 @@ class BrowserManager extends node_events_1.EventEmitter {
             if (isMainFrame && !isInPlace) managed.mainNavigationSequence = (managed.mainNavigationSequence || 0) + 1;
         });
         wc.on('dom-ready', () => {
-            if (extractGoogleBlockContinueUrl(wc.getURL()))
+            if (this.workflow !== 'youtube' && extractGoogleBlockContinueUrl(wc.getURL()))
                 return;
             this.updateState(managed, {
                 loading: false,
@@ -357,7 +400,7 @@ class BrowserManager extends node_events_1.EventEmitter {
             });
         });
         wc.on('did-stop-loading', () => {
-            if (extractGoogleBlockContinueUrl(wc.getURL()))
+            if (this.workflow !== 'youtube' && extractGoogleBlockContinueUrl(wc.getURL()))
                 return;
             this.updateState(managed, {
                 loading: false,
@@ -369,6 +412,8 @@ class BrowserManager extends node_events_1.EventEmitter {
             });
         });
         wc.on('did-navigate', (_e, url, httpResponseCode) => {
+            if (this.workflow === 'youtube' && url !== 'about:blank')
+                Logger_1.logger.info('browser', `Browser ${id} committed page: ${safeNavigationUrl(url)} HTTP=${httpResponseCode ?? 'unknown'}.`);
             // A committed Google response proves reachability without waiting
             // for Ready or adding a separate proxy-validation request.
             try {
@@ -385,13 +430,17 @@ class BrowserManager extends node_events_1.EventEmitter {
                     (0, seo_1.hostMatchesTarget)(url, config.target)) managed.proxyHealth.targetOpened = true;
             } catch { /* Non-web navigation is not proxy health evidence. */ }
             this.updateState(managed, { url });
-            this.maybeHandleGoogleBlock(managed, url);
-            this.requestGoogleState(managed, true);
+            if (this.workflow !== 'youtube') {
+                this.maybeHandleGoogleBlock(managed, url);
+                this.requestGoogleState(managed, true);
+            }
         });
         wc.on('did-navigate-in-page', (_e, url) => {
             this.updateState(managed, { url });
-            this.maybeHandleGoogleBlock(managed, url);
-            this.requestGoogleState(managed, true);
+            if (this.workflow !== 'youtube') {
+                this.maybeHandleGoogleBlock(managed, url);
+                this.requestGoogleState(managed, true);
+            }
         });
         wc.on('page-title-updated', (_e, title) => this.updateState(managed, { title }));
         wc.on('page-favicon-updated', (_e, favicons) => this.updateState(managed, { faviconUrl: favicons[0] }));
@@ -401,18 +450,19 @@ class BrowserManager extends node_events_1.EventEmitter {
             if (managed.state.proxy && /^https?:\/\//i.test(_url) &&
                 ((isMainFrame && managed.googleConfig && (0, seo_1.isSearchResultsUrl)(_url, managed.googleConfig.engine)) || /ERR_PROXY_|ERR_TUNNEL_CONNECTION_FAILED/.test(errorDescription))) managed.proxyHealth.failed = true;
             if (!isMainFrame) return;
-            if (this.workflow === 'youtube' && managed.state.proxy && /^https?:\/\//i.test(_url)) {
+            if (this.workflow === 'youtube' && managed.state.proxy && isProxyTransportError(errorDescription)) {
                 managed.proxyHealth.failed = true;
             }
             this.updateState(managed, {
                 loading: false,
-                connectionStatus: managed.state.proxy ? 'proxy-failed' : 'no-proxy',
+                connectionStatus: this.workflow === 'youtube' && !isProxyTransportError(errorDescription)
+                    ? 'navigation-failed' : managed.state.proxy ? 'proxy-failed' : 'no-proxy',
                 errorMessage: errorDescription
             });
             Logger_1.logger.warn('browser', `Browser ${id} failed to load: ${errorDescription} (${errorCode})`);
         });
         wc.on('render-process-gone', (_e, details) => {
-            if (managed.state.proxy) managed.proxyHealth.failed = true;
+            if (this.workflow !== 'youtube' && managed.state.proxy) managed.proxyHealth.failed = true;
             Logger_1.logger.error('browser', `Browser ${id} renderer process gone: ${details.reason}`);
             this.updateState(managed, { connectionStatus: 'crashed', crashCount: managed.state.crashCount + 1 });
             void this.handleCrash(managed, options);
@@ -440,6 +490,7 @@ class BrowserManager extends node_events_1.EventEmitter {
                 Date.now() - lastUserInputAt > 1500 || managed.popupWindows.size >= 8)
                 return { action: 'deny' };
             lastUserInputAt = 0; // One input can authorize at most one child window.
+            if (this.workflow === 'youtube' && !isYouTubeNavigationAllowed(url, managed.playbackConfig?.videoUrl)) return { action: 'deny' };
             try {
                 const target = new URL(url || 'about:blank');
                 if (!['http:', 'https:'].includes(target.protocol) && target.href !== 'about:blank')
@@ -548,18 +599,17 @@ class BrowserManager extends node_events_1.EventEmitter {
     beginProxyCycle(id) {
         this.get(id).proxyHealth = { googleReached: false, youtubeReached: false, targetOpened: false, captchaSeen: false, failed: false };
     }
-    async releaseResearchDocument(managed, { signal, timeoutMs = 5_000 } = {}) {
+    async loadBlankDocument(managed, { signal, timeoutMs = 5_000, message = `Browser ${managed.id} could not release its outgoing video document.` } = {}) {
         const wc = managed.view.webContents;
-        if (managed.disposed || wc.isDestroyed()) return;
-        wc.stop();
-        // Stop already released this document. Re-navigating about:blank can
-        // race Chromium's delayed cancellation of an unfinished media request.
-        if (wc.getURL() === 'about:blank') return;
-        let navigated, destroyed;
+        managed.blankDocumentReady = false;
+        let navigated, ready, destroyed;
+        const wasBlank = wc.getURL() === 'about:blank';
         const closed = new Promise((resolve, reject) => {
             navigated = (_event, url) => { if (url === 'about:blank') resolve(); };
-            destroyed = () => resolve();
+            ready = () => { if (wc.getURL() === 'about:blank') resolve(); };
+            destroyed = () => reject(new Error(`Browser ${managed.id} closed before its blank document was ready.`));
             wc.on('did-navigate', navigated);
+            wc.on('dom-ready', ready);
             wc.on('destroyed', destroyed);
             void Promise.resolve().then(() => wc.loadURL('about:blank')).then(() => {
                 if (wc.getURL() === 'about:blank') resolve();
@@ -567,16 +617,44 @@ class BrowserManager extends node_events_1.EventEmitter {
                 // Electron can associate the outgoing request's ERR_FAILED or
                 // ERR_ABORTED with loadURL('about:blank'). Confirm the actual
                 // committed URL; never clear storage based on rejection alone.
-                if (!wc.isDestroyed() && wc.getURL() === 'about:blank') resolve();
+                if (!wc.isDestroyed() && !wasBlank && wc.getURL() === 'about:blank') resolve();
                 else if (!/ERR_ABORTED|ERR_FAILED|\(-[23]\)/i.test(error.message || String(error))) reject(error);
             });
         });
         try {
-            await waitForPreparation(closed, timeoutMs, signal,
-                `Browser ${managed.id} could not release its outgoing video document.`);
+            await waitForPreparation(closed, timeoutMs, signal, message);
+            if (managed.view.webContents === wc) managed.blankDocumentReady = true;
         } finally {
             wc.removeListener('did-navigate', navigated);
+            wc.removeListener('dom-ready', ready);
             wc.removeListener('destroyed', destroyed);
+        }
+    }
+    async releaseResearchDocument(managed, { signal, timeoutMs = 5_000 } = {}) {
+        const wc = managed.view.webContents;
+        if (managed.disposed || wc.isDestroyed()) return;
+        wc.stop();
+        if (wc.getURL() === 'about:blank' && managed.blankDocumentReady) return;
+        try {
+            await this.loadBlankDocument(managed, { signal, timeoutMs });
+        } catch (error) {
+            if (signal?.aborted || managed.disposed || this.disposed) throw error;
+            // Replace only the stalled native view; routing and pending storage
+            // cleanup remain owned by the same isolated session and workspace.
+            const oldView = managed.view;
+            const replacement = new electron_1.BrowserView({ webPreferences: {
+                session: managed.session, preload: join(__dirname, '../preload/workspace.js'),
+                contextIsolation: true, sandbox: true, nodeIntegration: false, webSecurity: true, javascript: true
+            } });
+            this.closePopupWindows(managed);
+            this.window?.removeBrowserView(oldView);
+            if (!wc.isDestroyed()) wc.close({ waitForBeforeUnload: false });
+            managed.view = replacement;
+            this.wireEvents(managed, managed.options);
+            if (managed.lastBounds) replacement.setBounds(managed.lastBounds);
+            this.window?.addBrowserView(replacement);
+            this.updateState(managed, { url: 'about:blank', loading: false });
+            await this.loadBlankDocument(managed, { signal, timeoutMs });
         }
     }
     async prepareCycleDocument(id, signal) {
@@ -642,7 +720,7 @@ class BrowserManager extends node_events_1.EventEmitter {
             void storageCleanup.then(clearPending, clearPending);
         }
         await waitForPreparation(storageCleanup, 15_000, signal, `Browser ${id} data clearing timed out before the next cycle.`);
-        wc.clearHistory?.();
+        managed.view.webContents.clearHistory?.();
         await this.clearCycleRendererCache(managed, signal);
     }
     async clearCycleRendererCache(managed, signal) {
@@ -660,28 +738,38 @@ class BrowserManager extends node_events_1.EventEmitter {
     }
     async navigate(id, url) {
         const managed = this.get(id);
+        this.assertYouTubeNavigation(managed, url);
         const normalized = normalizeUrl(url);
+        if (this.workflow === 'youtube') managed.blankDocumentReady = false;
         await managed.view.webContents.loadURL(normalized);
     }
     async reload(id) {
-        this.get(id).view.webContents.reload();
+        const managed = this.get(id);
+        this.assertYouTubeNavigation(managed, managed.view.webContents.getURL());
+        managed.view.webContents.reload();
+    }
+    assertYouTubeNavigation(managed, url) {
+        if (this.workflow === 'youtube' && !isYouTubeNavigationAllowed(url, managed.playbackConfig?.videoUrl)) {
+            throw new Error('Only the configured YouTube video and its consent, sign-in or verification pages can be opened.');
+        }
     }
     async stop(id) {
         this.get(id).view.webContents.stop();
     }
     async goBack(id) {
+        if (this.workflow === 'youtube') throw new Error('History navigation is unavailable during configured YouTube video playback.');
         const wc = this.get(id).view.webContents;
         if (wc.canGoBack())
             wc.goBack();
     }
     async goForward(id) {
+        if (this.workflow === 'youtube') throw new Error('History navigation is unavailable during configured YouTube video playback.');
         const wc = this.get(id).view.webContents;
         if (wc.canGoForward())
             wc.goForward();
     }
     async reloadAll() {
-        for (const managed of this.browsers.values())
-            managed.view.webContents.reload();
+        for (const managed of this.browsers.values()) await this.reload(managed.id);
     }
     async stopAll() {
         for (const managed of this.browsers.values())
@@ -703,6 +791,7 @@ class BrowserManager extends node_events_1.EventEmitter {
     }
     async restart(id) {
         const managed = this.get(id);
+        this.assertYouTubeNavigation(managed, managed.view.webContents.getURL());
         managed.restartAttempts = 0;
         managed.view.webContents.reload();
     }
@@ -728,6 +817,7 @@ class BrowserManager extends node_events_1.EventEmitter {
      */
     async assignProxy(id, proxy) {
         const managed = this.get(id);
+        this.cancelProxyHealthCheck(managed);
         // Routing changes for the same session must settle in request order.
         // Other browsers continue concurrently without a shared queue.
         const previous = managed.proxyChange ?? Promise.resolve();
@@ -759,6 +849,7 @@ class BrowserManager extends node_events_1.EventEmitter {
         managed.controlledKeepAliveContinuous = false;
         this.updateState(managed, {
             proxy,
+            proxyHealthCheck: undefined,
             connectionStatus: proxy ? 'proxy-checking' : 'no-proxy',
             errorMessage: undefined,
             keepAliveEnabled: false,
@@ -780,6 +871,40 @@ class BrowserManager extends node_events_1.EventEmitter {
         // fire-and-forget, so the old about:blank reload could race and win
         // against the Google load started immediately after assignment.
         // The automation layer performs the first navigation explicitly.
+    }
+    cancelProxyHealthCheck(managed) {
+        managed.healthCheckSequence = (managed.healthCheckSequence || 0) + 1;
+        managed.healthCheckController?.abort();
+        managed.healthCheckController = null;
+    }
+    async checkProxyHealth(id, videoUrl, { signal } = {}) {
+        const managed = this.get(id);
+        this.cancelProxyHealthCheck(managed);
+        const sequence = managed.healthCheckSequence;
+        const controller = new AbortController();
+        managed.healthCheckController = controller;
+        const abort = () => controller.abort();
+        signal?.addEventListener('abort', abort, { once: true });
+        if (signal?.aborted) abort();
+        const current = () => !this.disposed && !managed.disposed &&
+            this.browsers.get(id) === managed && managed.healthCheckSequence === sequence && !controller.signal.aborted;
+        try {
+            await waitForPreparation(managed.proxyChange, 15_000, controller.signal, `Browser ${id} proxy routing did not settle.`);
+            if (!current()) throw preparationCancelled();
+            if (!managed.proxyRoutingReady || !managed.state.proxy) throw new Error(`Browser ${id} has no assigned proxy.`);
+            const health = await checkProxyHealth(managed.session, videoUrl, { signal: controller.signal, isCurrent: current });
+            if (!current()) throw preparationCancelled();
+            const proxyFailed = ['proxy-authentication', 'proxy-transport-error'].includes(health.code);
+            if (proxyFailed) managed.proxyHealth.failed = true;
+            this.updateState(managed, { proxyHealthCheck: health,
+                ...(health.status === 'failed' ? { connectionStatus: proxyFailed ? 'proxy-failed' : 'navigation-failed',
+                    playback: { status: 'error', code: health.code, message: health.message, videoUrl } } : {}) });
+            Logger_1.logger.info('proxy', `Browser ${id} transport check: ${health.status} code=${health.code} HTTP=${health.httpStatus ?? 'none'}.`);
+            return health;
+        } finally {
+            signal?.removeEventListener('abort', abort);
+            if (managed.healthCheckController === controller) managed.healthCheckController = null;
+        }
     }
     async checkIp(id, ipCheckUrl) {
         const managed = this.get(id);
@@ -838,10 +963,12 @@ class BrowserManager extends node_events_1.EventEmitter {
         }
         const wc = managed.view.webContents;
         const token = this.startMeasurementSession(id);
+        const current = () => !signal?.aborted && !managed.disposed && this.browsers.get(id) === managed &&
+            managed.playbackController === controller && this.isMeasurementSessionCurrent(id, token);
         const controller = new YouTubePlaybackController(wc, {
             url: normalized, muted, signal,
             onState: (playback) => {
-                if (signal?.aborted || managed.playbackController !== controller || !this.isMeasurementSessionCurrent(id, token)) return;
+                if (!current()) return;
                 const reached = playback.status === 'unavailable' ||
                     (playback.readyState >= 1 && playback.contentKind !== 'advertisement' &&
                         ['ready', 'playing', 'paused', 'buffering', 'ended', 'autoplay-blocked'].includes(playback.status));
@@ -850,33 +977,36 @@ class BrowserManager extends node_events_1.EventEmitter {
                 // applied the chosen media mute, let normal player controls
                 // work and keep the displayed media state truthful.
                 if (playback.readyState >= 1) wc.setAudioMuted(false);
-                if (playback.mediaErrorCode === 2) managed.proxyHealth.failed = true;
                 if (playback.status === 'interaction-required' && /captcha|unusual traffic|not a bot/i.test(playback.message || '')) {
                     managed.proxyHealth.captchaSeen = true;
                 }
                 this.updateState(managed, { playback });
-                onState?.(playback);
+                if (current()) onState?.(playback);
             }
         });
         managed.playbackController = controller;
         managed.playbackConfig = { videoUrl: normalized, muted, signal, onState };
         wc.setAudioMuted(Boolean(muted));
         controller.start();
+        if (!current()) throw preparationCancelled();
         // A long-lived video response is allowed to keep loading. The
         // controller observes actual media without awaiting did-finish-load.
+        managed.blankDocumentReady = false;
+        Logger_1.logger.info('browser', `Browser ${id} requested video: ${normalized}.`);
         void wc.loadURL(normalized).catch((error) => {
-            if (signal?.aborted || managed.playbackController !== controller || /ERR_ABORTED|-3/i.test(error.message)) return;
-            managed.proxyHealth.failed = true;
-            const playback = { status: 'error', message: error.message, error: error.message,
+            if (!current() || /ERR_ABORTED|-3/i.test(error.message)) return;
+            if (isProxyTransportError(error.message)) managed.proxyHealth.failed = true;
+            const playback = { status: 'error', code: isProxyTransportError(error.message) ? 'proxy-transport-error' : 'navigation-error', message: error.message, error: error.message,
                 videoUrl: normalized, observedAt: new Date().toISOString() };
             this.updateState(managed, { playback });
-            onState?.(playback);
+            if (current()) onState?.(playback);
         });
         return controller.getState();
     }
     stopYouTubePlayback(id) {
         const managed = this.browsers.get(id);
         if (!managed) return Promise.resolve();
+        this.cancelProxyHealthCheck(managed);
         const controller = managed.playbackController;
         managed.playbackConfig = null;
         if (!controller && managed.playbackCleanup) return managed.playbackCleanup;
@@ -941,6 +1071,7 @@ class BrowserManager extends node_events_1.EventEmitter {
         } catch { /* A navigation can dispose the frame; the next poll retries. */ }
     }
     async broadcastSearch(id, query, targetWebsite, maxPages = 20, measurementToken, searchEngine = 'google') {
+        if (this.workflow === 'youtube') throw new Error('Search navigation is unavailable in PRX-YT.');
         const engine = (0, seo_1.normalizeSearchEngine)(searchEngine);
         const managed = this.get(id);
         const wc = managed.view.webContents;
@@ -1446,6 +1577,7 @@ class BrowserManager extends node_events_1.EventEmitter {
         this.window = null;
     }
     async clickControlledGoogleResult(id, query, controlledHost, expectedUrl, measurementToken, searchEngine = 'google') {
+        if (this.workflow === 'youtube') throw new Error('Search result navigation is unavailable in PRX-YT.');
         const managed = this.get(id);
         const wc = managed.view.webContents;
         const normalizedHost = (0, seo_1.normalizeTargetHost)(controlledHost);
@@ -1527,6 +1659,7 @@ class BrowserManager extends node_events_1.EventEmitter {
         return false;
     }
     startControlledKeepAlive(id, controlledHost) {
+        if (this.workflow === 'youtube') throw new Error('Keep Alive navigation is unavailable in PRX-YT.');
         const managed = this.get(id);
         const normalizedHost = (0, seo_1.normalizeTargetHost)(controlledHost);
         if (!normalizedHost)
@@ -1572,7 +1705,7 @@ class BrowserManager extends node_events_1.EventEmitter {
         electron_1.clipboard.writeText(text);
     }
     ensureKeepAliveTimer() {
-        if (this.disposed) return;
+        if (this.disposed || this.workflow === 'youtube') return;
         if (this.keepAliveTimer)
             return;
         // Keep the driver independent from bootstrap timing. Individual browser
@@ -1747,6 +1880,7 @@ class BrowserManager extends node_events_1.EventEmitter {
         }
     }
     async runKeepAliveAction(managed, generation) {
+        if (this.workflow === 'youtube') return;
         const wc = managed.view.webContents;
         const pagesVisited = managed.keepAliveHops + 1;
         let stage = managed.keepAliveStage ?? 0;

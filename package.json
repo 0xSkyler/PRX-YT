@@ -1,7 +1,7 @@
 {
   "name": "prx-yt",
   "productName": "PRX-YT",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Isolated YouTube playback testing, availability research and diagnostics",
   "author": "PRX-YT",
   "license": "MIT",
@@ -67,5 +67,5 @@
     }
   },
   "linuxRelease": "v1.0.0",
-  "windowsRelease": "v1.0.0"
+  "windowsRelease": "v1.1.0"
 }
