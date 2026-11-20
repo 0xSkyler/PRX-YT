@@ -16,8 +16,6 @@ jobs:
   windows:
     runs-on: windows-latest
     timeout-minutes: 40
-    env:
-      PRX_YT_INSTALL_DIR: ${{ runner.temp }}\prx-yt-installed
     steps:
       - uses: actions/checkout@v4
       - uses: actions/setup-node@v4
@@ -35,21 +33,25 @@ jobs:
       - name: Verify packaged source and playback controller
         run: node scripts/check-package.cjs release-windows/win-unpacked/resources/app.asar
       - name: Exercise the unpacked application with local playback fixtures
+        env:
+          PRX_YT_SMOKE_SCREENSHOT: release-windows/prx-yt-dashboard.png
         run: node scripts/smoke-youtube-playback.cjs release-windows/win-unpacked/PRX-YT.exe
       - name: Install into a clean directory
         shell: pwsh
         run: |
           $installer = (Resolve-Path 'release-windows/PRX-YT-v1.0.0-Windows-x64-Setup.exe').Path
-          if (Test-Path $env:PRX_YT_INSTALL_DIR) { throw 'The installer test directory is not empty' }
-          $process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$env:PRX_YT_INSTALL_DIR" -Wait -PassThru
+          $installDir = Join-Path $env:RUNNER_TEMP 'prx-yt-installed'
+          if (Test-Path $installDir) { throw 'The installer test directory is not empty' }
+          $process = Start-Process -FilePath $installer -ArgumentList '/S', "/D=$installDir" -Wait -PassThru
           if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
-          if (!(Test-Path "$env:PRX_YT_INSTALL_DIR/PRX-YT.exe")) { throw 'Installed PRX-YT.exe is missing' }
+          if (!(Test-Path "$installDir/PRX-YT.exe")) { throw 'Installed PRX-YT.exe is missing' }
       - name: Verify installed source and playback behavior
         shell: pwsh
         run: |
-          node scripts/check-package.cjs "$env:PRX_YT_INSTALL_DIR/resources/app.asar"
+          $installDir = Join-Path $env:RUNNER_TEMP 'prx-yt-installed'
+          node scripts/check-package.cjs "$installDir/resources/app.asar"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          node scripts/smoke-youtube-playback.cjs "$env:PRX_YT_INSTALL_DIR/PRX-YT.exe"
+          node scripts/smoke-youtube-playback.cjs "$installDir/PRX-YT.exe"
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
       - name: Checksum the verified Windows installer
         shell: pwsh
@@ -64,6 +66,12 @@ jobs:
             release-windows/PRX-YT-v1.0.0-Windows-x64-Setup.exe
             release-windows/SHA256SUMS-windows.txt
           if-no-files-found: error
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: prx-yt-v1.0.0-validation
+          path: release-windows/prx-yt-*.png
+          if-no-files-found: ignore
 
   publish:
     needs: windows

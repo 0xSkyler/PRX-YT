@@ -238,6 +238,9 @@ async function run() {
     phase = 'verifying real media playback';
     await waitForBrowsers(states => states.length === 2 && states.every(state => state.playback?.status === 'playing' && state.playback.currentTime > 0), 'Actual media playback');
     const first = await mediaSnapshot();
+    if (process.env.PRX_YT_SMOKE_SCREENSHOT) await page.screenshot({
+        path: path.resolve(process.env.PRX_YT_SMOKE_SCREENSHOT.replace(/\.png$/, '-playing.png'))
+    });
     assert.ok(first.every(value => value.media && value.media.currentTime > 0 && value.media.duration >= 6 && value.media.duration <= 8));
     assert.ok(first.every(value => value.media.muted && !value.media.paused && value.fixture.beforeStorage === null));
     assert.ok(first.some(value => value.loading), 'The fixture did not keep network loading unfinished during playback');
@@ -360,6 +363,9 @@ async function run() {
 run().catch(async error => {
     console.error(`YouTube native smoke failed during ${phase}: ${error.stack || error}`);
     if (app) {
+        if (page && process.env.PRX_YT_SMOKE_SCREENSHOT) {
+            await page.screenshot({ path: path.resolve(process.env.PRX_YT_SMOKE_SCREENSHOT.replace(/\.png$/, '-failure.png')) }).catch(() => {});
+        }
         try { console.error(JSON.stringify(await withinDeadline(browserStates(), 3000, 'Failure state'), null, 2)); }
         catch { /* The renderer may already have exited. */ }
     }
