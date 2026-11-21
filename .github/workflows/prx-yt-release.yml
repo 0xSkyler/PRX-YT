@@ -64,6 +64,8 @@ jobs:
           if ($process.ExitCode -ne 0) { throw "Installer exited with $($process.ExitCode)" }
           if (!(Test-Path "$installDir/PRX-YT.exe")) { throw 'Installed PRX-YT.exe is missing' }
       - name: Verify installed source and playback behavior
+        env:
+          PRX_YT_VALIDATION_REPORT: release-windows/prx-yt-installed-validation.json
         shell: pwsh
         run: |
           $installDir = Join-Path $env:RUNNER_TEMP 'prx-yt-installed'
@@ -84,6 +86,7 @@ jobs:
             release-windows/PRX-YT-v1.1.0-Windows-x64-Setup.exe
             release-windows/SHA256SUMS-windows.txt
             release-windows/prx-yt-native-validation.json
+            release-windows/prx-yt-installed-validation.json
           if-no-files-found: error
       - uses: actions/upload-artifact@v4
         if: always()
@@ -128,6 +131,7 @@ jobs:
             dist/windows/PRX-YT-v1.1.0-Windows-x64-Setup.exe \
             dist/windows/SHA256SUMS-windows.txt \
             dist/windows/prx-yt-native-validation.json \
+            dist/windows/prx-yt-installed-validation.json \
             --target "$GITHUB_SHA" \
             --title 'PRX-YT v1.1.0 — YouTube playback diagnostics' \
             --notes-file docs/PRX-YT-RELEASE-NOTES.md

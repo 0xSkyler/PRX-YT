@@ -216,6 +216,8 @@ class BrowserManager extends node_events_1.EventEmitter {
         this.wireEvents(managed, options);
         const startUrl = normalizeUrl(options.startPage);
         try {
+            // Offscreen Windows views can otherwise keep Chromium's initial zero-size viewport.
+            if (this.workflow === 'youtube') view.setBounds({ x: 0, y: 0, width: 640, height: 360 });
             this.window?.addBrowserView(view);
             if (this.workflow === 'youtube') await this.loadBlankDocument(managed, {
                 signal, timeoutMs: this.preparationTimeoutMs,
@@ -651,10 +653,16 @@ class BrowserManager extends node_events_1.EventEmitter {
             if (!wc.isDestroyed()) wc.close({ waitForBeforeUnload: false });
             managed.view = replacement;
             this.wireEvents(managed, managed.options);
-            if (managed.lastBounds) replacement.setBounds(managed.lastBounds);
+            replacement.setBounds({ x: 0, y: 0, width: 640, height: 360 });
             this.window?.addBrowserView(replacement);
             this.updateState(managed, { url: 'about:blank', loading: false });
-            await this.loadBlankDocument(managed, { signal, timeoutMs });
+            try {
+                await this.loadBlankDocument(managed, { signal, timeoutMs });
+            } finally {
+                if (managed.view === replacement && !replacement.webContents.isDestroyed() && managed.lastBounds) {
+                    replacement.setBounds(managed.lastBounds);
+                }
+            }
         }
     }
     async prepareCycleDocument(id, signal) {

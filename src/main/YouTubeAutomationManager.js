@@ -564,7 +564,7 @@ class YouTubeAutomationManager extends node_events_1.EventEmitter {
                     this.emit('playbackResult', { cycleNumber, result: {
                         ...state, browserId, videoUrl, ranAt: state.observedAt || new Date().toISOString()
                     }});
-                    if (state.code === 'proxy-transport-error' && !this.blockedBrowserIds.has(browserId)) {
+                    if (['proxy-authentication', 'proxy-transport-error'].includes(state.code) && !this.blockedBrowserIds.has(browserId)) {
                         const key = `${generation}:${cycleNumber}:${browserId}:${proxy.id || `${proxy.host}:${proxy.port}`}`;
                         if (this.recoveringBrowsers.has(key)) return;
                         this.recoveringBrowsers.add(key);
@@ -586,7 +586,7 @@ class YouTubeAutomationManager extends node_events_1.EventEmitter {
                 browserId, videoUrl, status: 'error', error: error.message,
                 code: error.code, message: error.message, ranAt: new Date().toISOString()
             }});
-            if (error.code === 'proxy-transport-error') {
+            if (['proxy-authentication', 'proxy-transport-error'].includes(error.code)) {
                 const replacement = this.replaceFailedAssignment(generation, cycleNumber, browserId, proxy, videoUrl, signal);
                 if (replacement) return this.handleAssignment(generation, cycleNumber, replacement, videoUrl, muted, signal);
                 return;

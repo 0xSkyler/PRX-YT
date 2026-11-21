@@ -349,7 +349,8 @@ class YouTubePlaybackController {
         });
         listen('did-fail-load', (_event, errorCode, errorDescription, _url, isMainFrame) => {
             if (!isMainFrame || errorCode === -3 || !this.active) return;
-            this.publish({ ...this.state, status: 'error', code: 'navigation-error', message: cleanMessage(errorDescription) || 'The video page could not load.' });
+            const code = /ERR_PROXY_|ERR_TUNNEL_|ERR_SOCKS_/i.test(errorDescription || '') ? 'proxy-transport-error' : 'navigation-error';
+            this.publish({ ...this.state, status: 'error', code, message: cleanMessage(errorDescription) || 'The video page could not load.' });
         });
         listen('dom-ready', () => { this.history = {}; this.schedule(0); });
         this.publish(this.state);

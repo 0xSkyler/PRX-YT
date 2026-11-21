@@ -1,25 +1,40 @@
 # PRX-YT 1.1.0 validation
 
-Development validation on Windows 10 Pro x64, approximately 31.3 GiB usable RAM. Original PRX-YT HEAD: `0b23ee3e7120d28f2d5e18030ffde370d6ceb274`. ProxyDesk was read only. November 21, 2026, Asia/Dhaka.
+Repair baseline: `45d6eeeb2dab23c28896f4d3482dbb19108314f9`, branch `release/v1.1.0`, repository `0xSkyler/PRX-YT`. November 21, 2026, Asia/Dhaka. No ProxyDesk changes.
 
-## Recorded checks
+## CAPTCHA root cause and correction
 
-- Full Node suite: 221 tests, 218 passed, 3 Linux-only deployment tests skipped on Windows, zero failures. The Linux release job runs the deployment tests.
-- Source import/package identity check: 25 reachable modules, no external production imports.
-- Native source fixture: passed, 313.5 seconds total. Browser 2 pending blank-load promise, real advancing local HTML5 media, natural ending, Pause/Play/Mute, scheduled/manual reset, CAPTCHA holding, cancellation during 100 preparation, recovery, multiple videos, HTTP 403/429 restrictions, persisted settings and restart.
-- Full native fleet: 100 prepared IDs, 101 native web contents including dashboard. First cycle prepared in approximately 20.3 seconds from an existing 20-workspace pool; held for 5 seconds. These were lightweight local pages, not 100 video streams.
-- Resource snapshot at 100: 105 processes, approximately 9.34 GiB summed working sets and 7.80 GiB free system memory. Working sets can count shared pages more than once and are different from private memory used by the watchdog.
-- Local media soak: 20 workspaces, 180.014 seconds, seven cycles, 120 observations of advancing media. The local clip lasts 7 seconds and cycles every 30 seconds; this is a periodic lifecycle test, not uninterrupted decoding for three minutes.
-- Random multi-link distribution: 20 workspaces, two supplied local video IDs; all actual loaded URLs belonged to that set and stayed assigned after a cycle reset.
-- HEAD 403/429 cases: access requiring action, zero media play attempts, no failed-proxy claim. Stop verified blank documents and no media elements.
-- Separate live check: official Blender sample `aqz-KE-bpKQ` over the PC's normal direct connection, HEAD/GET 200, one navigation, no proxy provider, no retries. During 30.312 seconds of observation actual media advanced to 26.193 seconds, readyState 4, no media error. This tested the production controller and native view with direct transport, not a public proxy.
+The failed Windows run was not a CAPTCHA navigation or cycle race. With a small window at startup, Browser 2 was entirely below the dashboard viewport. Its native card bounds were nonzero, but Chromium retained its initial internal viewport of 0 by 0. The challenge form existed in the expected document and cycle, with visible CSS and height 105.6, but width 0. The strict positive-geometry detector therefore continued to report paused media.
 
-Final release gates rerun regression checks, bundled Node tests, archive source parity and the extended native fixture on the packaged application, including a real local rejected CONNECT tunnel followed by unused-proxy replacement. A clean Windows CI runner installs the NSIS artifact and tests the installed application. Publication depends on both Windows and Linux jobs; installer SHA-256 and native JSON evidence are release assets.
+A local native reproduction used an approximately 808 by 524 content window at display scale 1.25. It reproduced the failure in document 6, cycle 3, without changing the production controller or fixture styling. New YouTube native views now receive a 640 by 360 initial viewport before attachment. Renderer card positioning still controls their eventual bounds. The same small-startup reproduction then measured a 640 by 360 internal viewport, a 640 by 17.6 challenge form, and the correct interaction-required diagnostic.
 
-## Limits and unperformed checks
+The fixture now checks challenge geometry, document and cycle identity, paused media, the actual User action required card label, and absence of a failed-proxy status. Logs and validation JSON retain the geometry. CAPTCHA detection remains strict; no challenge is solved, hidden, bypassed, or rotated around.
 
-No 24-hour soak, 100 simultaneous continuous live streams, or vetted public-proxy pool was tested. The 100-workspace result is preparation and brief lightweight hold only. Public proxy reliability and future YouTube changes remain external constraints. Never interpret a successful transport check as verified playback.
+## Regression checks
 
-The source fixture preceded final race-review fixes; the release pipeline tests the final packaged source again. Local NSIS output under Documents was blocked by Windows Controlled Folder Access; validation builds use a task-specific temporary folder without disabling protection. Local installation is left to clean CI to avoid replacing this PC's existing PRX-YT registration.
+- Windows Node suite: 233 tests, 230 passed, 3 Linux deployment tests skipped, zero failures.
+- Bundled Electron Node suite: the same 233 tests, 230 passed, 3 skipped, zero failures.
+- Source check: 25 reachable modules, zero external production dependencies.
+- Complete small-window native source fixture: passed in 97.75 seconds. A separate native replacement check confirmed that the initial blank document must load before restoring an offscreen card position. Final lifecycle regressions also verify card restoration after failed or cancelled replacement loads, without moving destroyed or superseded views. The release gates below rerun the final packaged source.
+- Native main-frame proxy, tunnel and SOCKS errors retain their transport classification after initial navigation. DNS and certificate failures remain distinct navigation failures; aborted and subframe events cannot request replacement.
+- HTTP 407 rejects and removes the failed proxy, consumes only unused candidates within the existing three-candidate limit, and preserves the assigned video. Exhaustion does not start direct playback. HTTP 403, HTTP 429 and CAPTCHA continue to reserve their routes and require manual action, including after late failure callbacks.
 
-The installer is unsigned. Electron 31.2.1 is inherited and was not upgraded; its age remains a security/media-compatibility limit. Resource pressure pauses work and requires manual recovery. Consent/CAPTCHA/access restrictions are never solved, bypassed or automatically rotated around.
+## Windows release gates
+
+Publication requires both Linux and Windows jobs to succeed for the release commit. The Windows job builds a new installer, checks archive/source parity and application identity, then runs the native fixture on the unpacked application with all of these checks:
+
+- Real advancing local HTML5 media, natural ending, Pause/Play/Mute and autoplay rejection.
+- Browser 2 pending blank-load regression, scheduled/manual cycle cleanup, isolated sessions and CAPTCHA holding.
+- Fleet growth, cancellation during 100-workspace preparation and successful restart.
+- A bounded 180-second lifecycle soak with 20 local videos; the clip lasts 7 seconds and cycles every 30 seconds.
+- Preparation of 100 native lightweight workspaces, a brief hold and recovery to 20 video workspaces.
+- Stable multiple-video assignments, a real rejected local CONNECT tunnel followed by unused-proxy replacement, and distinct HTTP 403/429 diagnostics.
+- Persisted settings and graceful application restart.
+
+The job then silently installs the NSIS installer into a clean directory, checks its installed archive against the source, and reruns the native playback fixture on the installed executable. Only afterward does it checksum the installer and allow publication. The release includes `SHA256SUMS-windows.txt`, `prx-yt-native-validation.json` and `prx-yt-installed-validation.json`; the reports record actual results, timings, resource samples and scope. Existing releases are never overwritten.
+
+## Limits
+
+Native fixtures serve local media through test-only protocol handlers. They make zero public YouTube requests and do not establish live public-proxy availability. The 100-workspace check uses lightweight pages, not 100 simultaneous continuous video streams. The finite soak does not establish 24-hour uptime. No fresh live YouTube or public-proxy test was performed for this repair.
+
+The installer is unsigned. Electron 31.2.1 is inherited and was not upgraded; its age remains a security and media-compatibility limitation. Resource pressure pauses work and requires manual recovery. Actual capacity depends on CPU, memory, network bandwidth, content and proxy quality.

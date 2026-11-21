@@ -16,6 +16,28 @@ async function fixture() {
     return { manager, managed, wc, electron };
 }
 
+test('YouTube workspaces initialize a nonzero native viewport before the first blank load', async () => {
+    const electron = fakeElectron(), OriginalView = electron.BrowserView;
+    const firstLoads = [];
+    electron.BrowserView = class extends OriginalView {
+        constructor(options) {
+            super(options);
+            const nativeLoad = this.webContents.loadURL.bind(this.webContents);
+            this.webContents.loadURL = url => {
+                firstLoads.push(this.bounds);
+                return nativeLoad(url);
+            };
+        }
+    };
+    const { BrowserManager } = loadTree(path.resolve(__dirname, '../src'), electron)('main/BrowserManager.js');
+    const manager = new BrowserManager({ workflow: 'youtube' });
+    manager.attachWindow(electron.window);
+    await manager.createBrowser(1, { startPage: 'about:blank' });
+    assert.ok(firstLoads[0]?.width > 0 && firstLoads[0]?.height > 0, 'The first document had no native layout viewport');
+    assert.equal(manager.get(1).lastBounds, undefined, 'Initial viewport sizing must not suppress the renderer card bounds');
+    await manager.destroyAll();
+});
+
 test('YouTube workspaces use only the cache preload and ignore inherited automatic prompt messages', async () => {
     const f = await fixture();
     assert.ok(f.managed.view.options.webPreferences.preload.endsWith('workspace.js'));
@@ -185,6 +207,75 @@ test('a stuck outgoing document is replaced in its existing session before clean
     clearing.resolve();
     await f.manager.destroyAll();
 });
+
+test('a replacement initializes its viewport before restoring an offscreen card position', async () => {
+    const f = await fixture(), OriginalView = f.electron.BrowserView;
+    const card = { x: 15, y: 1200, width: 762, height: 360 };
+    f.manager.setBounds(1, card);
+    let loadedBounds;
+    f.electron.BrowserView = class extends OriginalView {
+        constructor(options) {
+            super(options);
+            const nativeLoad = this.webContents.loadURL.bind(this.webContents);
+            this.webContents.loadURL = url => {
+                loadedBounds = { ...this.bounds };
+                return nativeLoad(url);
+            };
+        }
+    };
+    f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
+    f.wc.loadURL = () => Promise.reject(new Error('Native blank navigation could not start.'));
+    await f.manager.releaseResearchDocument(f.managed, { timeoutMs: 10 });
+    assert.ok(loadedBounds.width > 0 && loadedBounds.height > 0, 'The replacement had no initial layout viewport');
+    assert.equal(loadedBounds.x, 0);
+    assert.equal(loadedBounds.y, 0, 'The replacement loaded below the window before its viewport could initialize');
+    assert.deepEqual({ ...f.managed.view.bounds }, card, 'The replacement did not restore its renderer card position');
+    await f.manager.destroyAll();
+});
+
+test('a failed replacement blank load still restores its live card position', async () => {
+    const f = await fixture(), OriginalView = f.electron.BrowserView;
+    const card = { x: 15, y: 1200, width: 762, height: 360 };
+    f.manager.setBounds(1, card);
+    f.electron.BrowserView = class extends OriginalView {
+        constructor(options) {
+            super(options);
+            this.webContents.loadURL = () => Promise.reject(new Error('Replacement blank navigation failed.'));
+        }
+    };
+    f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
+    f.wc.loadURL = () => Promise.reject(new Error('Native blank navigation could not start.'));
+    await assert.rejects(f.manager.releaseResearchDocument(f.managed, { timeoutMs: 10 }), /Replacement blank navigation failed/);
+    assert.deepEqual({ ...f.managed.view.bounds }, card, 'The failed replacement was left covering the dashboard');
+    await f.manager.destroyAll();
+});
+
+for (const ownership of ['live', 'destroyed', 'replaced']) {
+    test(`cancelled replacement cleanup preserves AbortError with a ${ownership} view`, async () => {
+        const f = await fixture(), OriginalView = f.electron.BrowserView, loading = deferred(), cancelled = new AbortController();
+        const card = { x: 15, y: 1200, width: 762, height: 360 };
+        f.manager.setBounds(1, card);
+        f.electron.BrowserView = class extends OriginalView {
+            constructor(options) {
+                super(options);
+                this.webContents.loadURL = () => { loading.resolve(); return new Promise(() => {}); };
+            }
+        };
+        f.wc.url = 'https://www.youtube.com/watch?v=abcdefghijk';
+        f.wc.loadURL = () => Promise.reject(new Error('Native blank navigation could not start.'));
+        const outcome = assert.rejects(f.manager.releaseResearchDocument(f.managed, { signal: cancelled.signal, timeoutMs: 200 }), { name: 'AbortError' });
+        await loading.promise;
+        const replacement = f.managed.view;
+        if (ownership === 'destroyed') replacement.webContents.close();
+        if (ownership === 'replaced') f.managed.view = new OriginalView(replacement.options);
+        if (ownership !== 'live') replacement.setBounds = () => { throw new Error('A stale view was repositioned'); };
+        cancelled.abort();
+        await outcome;
+        if (ownership === 'live') assert.deepEqual({ ...replacement.bounds }, card);
+        else if (!replacement.webContents.isDestroyed()) replacement.webContents.close();
+        await f.manager.destroyAll();
+    });
+}
 
 test('cycle preparation clears history on the replacement view after releasing a failed native document', async () => {
     const f = await fixture(), OriginalView = f.electron.BrowserView;

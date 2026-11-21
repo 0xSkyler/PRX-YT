@@ -183,6 +183,7 @@ async function installResearchFixtures() {
                         document.getElementById('movie_player').appendChild(error);
                     };
                     window.fixture.showCaptcha = () => {
+                        window.fixture.captchaShownAt = Date.now();
                         video.pause();
                         const form = document.createElement('form'); form.id = 'captcha-form';
                         form.textContent = 'Verification or CAPTCHA requires your action.';
@@ -220,10 +221,19 @@ async function mediaSnapshot(ids = [1, 2]) {
             if (!wc) { values.push({ browserId: id, absent: true }); continue; }
             const value = await wc.mainFrame.executeJavaScript(`(() => {
                 const video = document.querySelector('video');
+                const captcha = document.getElementById('captcha-form');
+                const captchaStyle = captcha && getComputedStyle(captcha);
+                const captchaRect = captcha && captcha.getBoundingClientRect();
+                const guard = window.__prxYtPlayback;
                 return { browserId: ${id}, url: location.href, fixture: window.fixture ? { browserId: window.fixture.browserId,
                     documentId: window.fixture.documentId, videoId: window.fixture.videoId, expectedCycle: window.fixture.expectedCycle, mode: window.fixture.mode,
                     beforeStorage: window.fixture.beforeStorage,
-                    playCount: window.fixture.playCount, endedCount: window.fixture.endedCount } : null,
+                    playCount: window.fixture.playCount, endedCount: window.fixture.endedCount, captchaShownAt: window.fixture.captchaShownAt } : null,
+                    viewport: { width: innerWidth, height: innerHeight, visibility: document.visibilityState },
+                    captcha: captcha ? { display: captchaStyle.display, visibility: captchaStyle.visibility, opacity: captchaStyle.opacity,
+                        x: captchaRect.x, y: captchaRect.y, width: captchaRect.width, height: captchaRect.height } : null,
+                    playbackGuard: guard ? { runId: guard.runId, stopped: guard.stopped, completed: guard.completed,
+                        manualPaused: guard.manualPaused, videoToken: guard.videoToken } : null,
                     localStorage: location.protocol === 'https:' ? localStorage.getItem('prx-fixture-session') : null,
                     media: video ? { currentTime: video.currentTime, duration: video.duration, ended: video.ended,
                         paused: video.paused, muted: video.muted, readyState: video.readyState } : null };
@@ -442,11 +452,36 @@ async function run() {
         const wc = webContents.getAllWebContents().find(value => value.session === session.fromPartition('persist:browser-2'));
         await wc.mainFrame.executeJavaScript('window.fixture.showCaptcha()', false);
     });
-    await waitForBrowsers(states => states[1].playback?.status === 'interaction-required', 'CAPTCHA diagnostic');
+    const captchaDocument = (await mediaSnapshot([2]))[0];
+    const captchaLayout = {
+        dashboard: await page.evaluate(() => ({ width: innerWidth, height: innerHeight, scale: devicePixelRatio, scrollY,
+            cards: Array.from(document.querySelectorAll('.browser-card__viewport')).map(element => {
+                const rect = element.getBoundingClientRect();
+                return { x: rect.x, y: rect.y, width: rect.width, height: rect.height };
+            }) })),
+        windows: await app.evaluate(({ BrowserWindow }) => BrowserWindow.getAllWindows().map(window => ({
+            bounds: window.getBounds(), content: window.getContentBounds(),
+            views: window.getBrowserViews().map(view => ({ webContentsId: view.webContents.id, bounds: view.getBounds() }))
+        })))
+    };
+    console.log(JSON.stringify({ nativeCaptchaFixture: captchaDocument, captchaLayout }));
+    assert.equal(captchaDocument.fixture.documentId, third[1].fixture.documentId, 'CAPTCHA was inserted into a different scheduled document');
+    assert.equal(captchaDocument.fixture.expectedCycle, scheduledCycle, 'CAPTCHA was inserted into a different cycle');
+    assert.ok(captchaDocument.captcha && captchaDocument.captcha.width > 0 && captchaDocument.captcha.height > 0 &&
+        captchaDocument.captcha.display !== 'none' && captchaDocument.captcha.visibility !== 'hidden' && Number(captchaDocument.captcha.opacity) !== 0,
+        `The native CAPTCHA fixture must be visible: ${JSON.stringify(captchaDocument)}`);
+    assert.equal(captchaDocument.media.paused, true, 'The CAPTCHA fixture did not pause its media');
+    const captchaStates = await waitForBrowsers(states => states[1].playback?.status === 'interaction-required', 'CAPTCHA diagnostic');
+    assert.notEqual(captchaStates[1].connectionStatus, 'proxy-failed', 'A reached CAPTCHA retained a proxy transport failure');
     const captchaCard = page.locator('.browser-card').filter({ has: page.getByText('Browser 2', { exact: true }) });
     assert.equal(await captchaCard.count(), 1, 'Browser 2 diagnostic card was not found');
-    assert.equal(await captchaCard.getByText('Proxy failed', { exact: true }).count(), 0,
+    assert.equal(await captchaCard.getByText('User action required', { exact: true }).count(), 1, 'The CAPTCHA card did not show its interaction diagnostic');
+    assert.equal(await captchaCard.getByText('Proxy transport failed', { exact: true }).count(), 0,
         'A reached CAPTCHA was mislabeled as a proxy transport failure');
+    report.checks.captchaFixture = { documentId: captchaDocument.fixture.documentId, cycle: captchaDocument.fixture.expectedCycle,
+        viewport: captchaDocument.viewport,
+        formRect: { x: captchaDocument.captcha.x, y: captchaDocument.captcha.y, width: captchaDocument.captcha.width, height: captchaDocument.captcha.height },
+        captchaStatus: captchaStates[1].playback.status, transportStatus: captchaStates[1].proxyHealthCheck?.status };
     const heldDocument = (await mediaSnapshot([2]))[0].fixture.documentId;
     await app.evaluate((_electron, cycle) => { globalThis.__prxYtFixture.expectedCycle = cycle; }, scheduledCycle + 1);
     await waitForCycle(scheduledCycle + 1, 45_000);

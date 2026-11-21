@@ -269,6 +269,42 @@ class WebContents extends EventEmitter {
     }
 }
 
+test('main-frame load failures preserve explicit proxy transport errors for replacement', async () => {
+    const wc = new WebContents(fixture()), states = [];
+    const controller = new YouTubePlaybackController(wc, { url, onState: state => states.push(state) });
+    controller.start();
+    try {
+        for (const [description, code] of [
+            ['ERR_PROXY_CONNECTION_FAILED', 'proxy-transport-error'],
+            ['ERR_TUNNEL_CONNECTION_FAILED', 'proxy-transport-error'],
+            ['ERR_SOCKS_CONNECTION_FAILED', 'proxy-transport-error'],
+            ['ERR_SOCKS_CONNECTION_HOST_UNREACHABLE', 'proxy-transport-error'],
+            ['ERR_NAME_NOT_RESOLVED', 'navigation-error'],
+            ['ERR_CERT_AUTHORITY_INVALID', 'navigation-error']
+        ]) {
+            wc.emit('did-fail-load', {}, -2, description, url, true);
+            assert.equal(states.at(-1).code, code, description);
+            assert.equal(states.at(-1).status, 'error');
+            assert.equal(states.at(-1).message, description);
+        }
+    } finally { await controller.stop(); }
+});
+
+test('aborted, subframe and stopped load failures cannot request proxy replacement', async () => {
+    const wc = new WebContents(fixture()), states = [];
+    const controller = new YouTubePlaybackController(wc, { url, onState: state => states.push(state) });
+    controller.start();
+    try {
+        const count = states.length;
+        wc.emit('did-fail-load', {}, -3, 'ERR_ABORTED', url, true);
+        wc.emit('did-fail-load', {}, -130, 'ERR_PROXY_CONNECTION_FAILED', url, false);
+        assert.equal(states.length, count);
+        await controller.stop();
+        wc.emit('did-fail-load', {}, -130, 'ERR_PROXY_CONNECTION_FAILED', url, true);
+        assert.equal(states.length, count);
+    } finally { await controller.stop(); }
+});
+
 test('inspection uses the current native main frame without waiting for full page load', async () => {
     const f = fixture(), wc = new WebContents(f);
     let frameCalls = 0;
